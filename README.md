@@ -28,6 +28,8 @@ Escopo: sem voz, wake word, STT, TTS, LLM, automação ou UI.
 | `runtime` | trait `Component`, `Supervisor`, `run` (SIGINT/SIGTERM) |
 | `instance` | lock `flock`: uma instância por usuário |
 | `verification` | `SUCCESS` / `FAILED` / `UNKNOWN` |
+| `session` | Session Manager (A0): sessões, requisições e tokens de cancelamento; só memória |
+| `harness` | Cenários reproduzíveis de teste (A0), com fonte virtual de STT sintético |
 
 ## Uso
 
@@ -48,12 +50,27 @@ Socket: `$XDG_RUNTIME_DIR/kavo/kavo.sock` (0600; diretório 0700).
 ## Testes
 
 ```bash
-cargo test                          # 110 testes (unitários e integração)
-cargo clippy --all-targets          # 0 avisos
+cargo test                          # 156 testes (unitários e integração)
+cargo clippy --all-targets --all-features -- -D warnings   # 0 avisos
 ```
 
 Integração inclui socket Unix real, supervisor com pânico e timeout, lock de instância e barramento.
-Testes E2E no computador real estão descritos em `docs/` e no relatório da fase.
+
+### Harness de cenários (A0)
+
+Fonte virtual de eventos de STT **sintéticos** (emissor `fonte-virtual`). Não há captura de áudio nem reconhecimento de fala.
+
+```bash
+target/release/kavo harness list
+target/release/kavo harness all                 # cenários em processo (barramento, monitor, SQLite temporário)
+target/release/kavo harness sessions cancel     # escolha de cenários
+target/release/kavo harness ipc-stream --socket "$KAVO_IPC_SOCKET_PATH" --store "$KAVO_STORE_PATH"   # contra núcleo em execução
+```
+
+Saída: uma linha JSON por verificação e uma por cenário. Código 0 = tudo aprovado; 1 = reprovação ou erro; 2 = uso inválido.
+`ipc-stream` exige núcleo em execução e banco do mesmo núcleo; não entra em `all`.
+
+Session Manager (`src/session.rs`): ciclo de vida de sessões e cancelamento por requisição, só em memória. Não concede permissões.
 
 ## Limitações
 

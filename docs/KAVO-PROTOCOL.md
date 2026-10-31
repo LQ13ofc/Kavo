@@ -65,6 +65,18 @@ Recebê-los hoje gera `ERROR` com classe `UNSUPPORTED_MESSAGE_TYPE` e mensagem "
 
 Regra: `correlation_id` nunca identifica sessão nem tarefa. Requisição = mensagem cujo `message_id` é aguardado por resposta.
 
+Mapeamento interno (A0, sem mudança de fio; ver `DECISIONS.md` D-41 a D-44):
+
+| Conceito | Identificador no fio | Dono |
+|---|---|---|
+| sessão de interação | `session_id` | `session::SessionManager` (só memória) |
+| mensagem | `message_id` | envelope |
+| requisição lógica | `message_id` da mensagem aguardada (`request_id` no código) | `SessionManager::begin_request` |
+| stream de fala | `payload.stream_id` (identidade `(session_id, stream_id)`, D-33) | `StreamTracker` e SQLite |
+| tarefa | reservada (não transmitida) | ainda não existe |
+
+`CANCEL` com `correlation_id` cancela a requisição; com `payload.stream_id` cancela o stream. Nenhum dos dois encerra sessão.
+
 `cancel_id` (doc 03) foi removido: o alvo do `CANCEL` é o `correlation_id` (decisão proposta, pendente).
 
 ## 5. Erros

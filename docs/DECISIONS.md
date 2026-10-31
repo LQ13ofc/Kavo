@@ -44,6 +44,13 @@ Legenda: **Aprovada** (pelo usuário) · **Provisória** (usada, aguarda revisã
 | D-15 | Entrega garantida: paralela, prazo único, falha se sem assinante ou falha parcial | Provisória | Revisão independente: evita perda silenciosa |
 | D-16 | Conexões: ociosidade 30 s e máximo 64 simultâneas | Provisória | Valores sem base de carga; ajustar após benchmark |
 | D-17 | Socket exige diretório pai 0700 | Provisória | Fecha janela entre bind e chmod |
+| D-41 | Session Manager (A0) é só ciclo de vida: abrir, encerrar, consultar; não concede permissões | Provisória | Implementado em `session.rs`; não integrado ao IPC (sem tipos de sessão no protocolo) |
+| D-42 | Sessão encerrada não reabre; evento de sessão desconhecida ou encerrada é rejeitado | Provisória | Impede que eventos atrasados ressuscitem sessão |
+| D-43 | Estado de sessão só em memória; reinício descarta sessões e requisições | Provisória | O que precisa ser durável continua no SQLite (D-31). Recuperação de sessão: pendente |
+| D-44 | Cancelamento por requisição: token por `request_id` (= `message_id` aguardado); idempotente; encerrar sessão cancela só as requisições dela | Provisória | Não cancela tarefas (não há Task Manager) nem outras sessões |
+| D-45 | Expiração de sessão por inatividade | Pendente | Nenhum prazo aprovado; não implementada |
+| D-46 | Harness A0: fonte virtual gera STT sintético (emissor `fonte-virtual`); não simula captura de áudio nem reconhecimento | Provisória | `kavo harness`; cenários contra barramento, monitor e SQLite reais |
+| D-47 | Producer envia eventos de um mesmo stream em uma conexão, em ordem | Provisória | Conexões separadas podem ser processadas fora de ordem (achado no E2E real); sem NACK (D-35) |
 
 ## Reconciliação 03-PROTOCOLOS × 10-CONTRATOS
 Detalhada em `KAVO-PROTOCOL.md`, seção 7.

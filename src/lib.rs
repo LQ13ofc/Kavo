@@ -3,6 +3,7 @@
 pub mod bus;
 pub mod config;
 pub mod error;
+pub mod harness;
 pub mod instance;
 pub mod intent;
 pub mod ipc;
@@ -10,6 +11,7 @@ pub mod logging;
 pub mod monitor;
 pub mod protocol;
 pub mod runtime;
+pub mod session;
 pub mod speech;
 pub mod store;
 pub mod verification;
