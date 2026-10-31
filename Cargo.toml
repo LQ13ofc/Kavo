@@ -1,0 +1,20 @@
+[package]
+name = "kavo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures = "0.3"
+rustix = { version = "1.1.6", features = ["fs"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util", "fs"] }
+tokio-util = "0.7.20"
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+uuid = { version = "1.26.1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
