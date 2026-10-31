@@ -151,7 +151,7 @@ fn wire_names_match_contract() {
     let msg = KavoMessage::new(MessageType::Heartbeat, "s", "kavo-core");
     let json: serde_json::Value = serde_json::from_slice(&msg.to_json_line().unwrap()).unwrap();
     assert_eq!(json["type"], "HEARTBEAT");
-    assert_eq!(json["schema_version"], "1.0");
+    assert_eq!(json["schema_version"], "1.1");
     assert!(json.get("message_id").is_some());
     assert!(json.get("hermes").is_none());
     assert!(
@@ -163,7 +163,7 @@ fn wire_names_match_contract() {
 #[test]
 fn reserved_types_are_reported_as_unsupported_not_unknown() {
     let line = raw(&format!(
-        r#"{{"type":"STT_RESULT","schema_version":"1.0","message_id":"{UUID_A}","session_id":"s","timestamp":1.0,"sender":"x"}}"#
+        r#"{{"type":"COMMAND_EXECUTED","schema_version":"1.0","message_id":"{UUID_A}","session_id":"s","timestamp":1.0,"sender":"x"}}"#
     ));
     let err = KavoMessage::from_json_slice(&line).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::UnsupportedMessageType);

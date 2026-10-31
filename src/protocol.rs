@@ -1,36 +1,42 @@
-//! Kavo Protocol v1.0-draft (ver `docs/KAVO-PROTOCOL.md`). Hermes JSON é só referência externa.
+//! Kavo Protocol v1.1-draft (ver `docs/KAVO-PROTOCOL.md`). Hermes JSON é só referência externa.
 //! Uma mensagem = um objeto JSON em uma linha (NDJSON). Validação ocorre na entrada e antes do envio.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+use uuid::{Uuid, Version};
 
 use crate::error::{KavoError, Result};
+use crate::intent::InterpretationPayload;
+use crate::speech::{CancelPayload, SpeechPayload};
 
 pub const PROTOCOL_NAME: &str = "Kavo Protocol";
-pub const SCHEMA_VERSION: &str = "1.0";
+pub const SCHEMA_VERSION: &str = "1.1";
 pub const SENDER_CORE: &str = "kavo-core";
 pub const UNKNOWN_SESSION: &str = "unknown";
 const MAX_SESSION_ID_LEN: usize = 128;
 const MAX_SENDER_LEN: usize = 64;
 const MAX_ERROR_MESSAGE_LEN: usize = 512;
 
-/// Nomes de wire dos tipos implementados em 1.0-draft (ver `MessageType`).
-pub const IMPLEMENTED_TYPES: &[&str] = &["HEARTBEAT", "ERROR", "CANCEL"];
+/// Nomes de wire dos tipos implementados em 1.1-draft (ver `MessageType`).
+pub const IMPLEMENTED_TYPES: &[&str] = &[
+    "HEARTBEAT",
+    "ERROR",
+    "CANCEL",
+    "STT_RESULT",
+    "INTENT_DETECTED",
+];
 
 /// Tipos reservados pela decisão 6.6, ainda não implementados. Recebê-los gera erro explícito.
 pub const RESERVED_TYPES: &[&str] = &[
-    "STT_RESULT",
     "WAKE_WORD_DETECTED",
-    "INTENT_DETECTED",
     "COMMAND_EXECUTED",
     "MEMORY_UPDATE",
     "SYSTEM_STATUS",
     "ASSISTANT_SPEAK",
 ];
 
-/// Códigos de erro do fio. Apenas `GENERIC_ERROR` é usado pela fundação (ver `ERROR-TAXONOMY.md`).
+/// Códigos de erro do fio. Apenas `GENERIC_ERROR` e os de STT são usados (ver `ERROR-TAXONOMY.md`).
 pub mod error_code {
     pub const STT_AUDIO_ERROR: u16 = 1001;
     pub const STT_MODEL_ERROR: u16 = 1002;
@@ -43,13 +49,15 @@ pub mod error_code {
     pub const GENERIC_ERROR: u16 = 1100;
 }
 
-/// Tipos implementados em 1.0-draft.
+/// Tipos implementados em 1.1-draft.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MessageType {
     Heartbeat,
     Error,
     Cancel,
+    SttResult,
+    IntentDetected,
 }
 
 /// Classe de entrega no barramento interno (ver `KAVO-PROTOCOL.md`, seção 6).
@@ -64,9 +72,16 @@ pub enum Delivery {
 impl MessageType {
     pub fn delivery(self) -> Delivery {
         match self {
-            Self::Error | Self::Cancel => Delivery::Guaranteed,
             Self::Heartbeat => Delivery::BestEffort,
+            Self::Error | Self::Cancel | Self::SttResult | Self::IntentDetected => {
+                Delivery::Guaranteed
+            }
         }
+    }
+
+    /// Tipos que carregam `payload`.
+    pub fn takes_payload(self) -> bool {
+        matches!(self, Self::Cancel | Self::SttResult | Self::IntentDetected)
     }
 }
 
@@ -88,6 +103,9 @@ pub struct KavoMessage {
     pub error_code: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Conteúdo tipado por `type` (1.1). Validado conforme o tipo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
 }
 
 impl KavoMessage {
@@ -106,12 +124,21 @@ impl KavoMessage {
             sender: sender.into(),
             error_code: None,
             error_message: None,
+            payload: None,
         }
     }
 
     pub fn with_correlation_id(mut self, message_id: impl Into<String>) -> Self {
         self.correlation_id = Some(message_id.into());
         self
+    }
+
+    /// Anexa payload tipado. A validação completa acontece em `validate`.
+    pub fn with_payload<T: Serialize>(mut self, payload: &T) -> Result<Self> {
+        let value = serde_json::to_value(payload)
+            .map_err(|e| KavoError::Protocol(format!("payload não serializável: {e}")))?;
+        self.payload = Some(value);
+        Ok(self)
     }
 
     /// Resposta a `self`: mesma sessão, `correlation_id` = `message_id` de `self`, emissor = núcleo.
@@ -156,19 +183,50 @@ impl KavoMessage {
         }
         check_text("session_id", &self.session_id, MAX_SESSION_ID_LEN)?;
         check_text("sender", &self.sender, MAX_SENDER_LEN)?;
+        if let Some(text) = &self.error_message {
+            check_text("error_message", text, MAX_ERROR_MESSAGE_LEN)?;
+        }
         if !self.timestamp.is_finite() || self.timestamp < 0.0 {
             return Err(KavoError::Protocol("timestamp inválido".to_owned()));
         }
+
         match self.kind {
             MessageType::Error if self.error_code.is_none() => {
-                Err(KavoError::Protocol("ERROR sem error_code".to_owned()))
+                return Err(KavoError::Protocol("ERROR sem error_code".to_owned()));
             }
-            MessageType::Cancel if self.correlation_id.is_none() => Err(KavoError::Protocol(
-                "CANCEL sem correlation_id do alvo".to_owned(),
+            MessageType::Heartbeat
+            | MessageType::Cancel
+            | MessageType::SttResult
+            | MessageType::IntentDetected
+                if self.error_code.is_some() =>
+            {
+                return Err(KavoError::Protocol(
+                    "error_code só é permitido em ERROR".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        self.validate_payload()
+    }
+
+    fn validate_payload(&self) -> Result<()> {
+        match (self.kind, &self.payload) {
+            (MessageType::Heartbeat | MessageType::Error, Some(_)) => Err(KavoError::Protocol(
+                format!("{:?} não aceita payload", self.kind),
             )),
-            MessageType::Heartbeat | MessageType::Cancel if self.error_code.is_some() => Err(
-                KavoError::Protocol("error_code só é permitido em ERROR".to_owned()),
+            (MessageType::SttResult, Some(p)) => SpeechPayload::from_value(p).map(|_| ()),
+            (MessageType::IntentDetected, Some(p)) => {
+                InterpretationPayload::from_value(p).map(|_| ())
+            }
+            (MessageType::SttResult | MessageType::IntentDetected, None) => Err(
+                KavoError::Protocol(format!("{:?} exige payload", self.kind)),
             ),
+            (MessageType::Cancel, Some(p)) => CancelPayload::from_value(p).map(|_| ()),
+            (MessageType::Cancel, None) if self.correlation_id.is_none() => {
+                Err(KavoError::Protocol(
+                    "CANCEL exige correlation_id do alvo ou payload.stream_id".to_owned(),
+                ))
+            }
             _ => Ok(()),
         }
     }
@@ -186,8 +244,11 @@ impl KavoMessage {
                     } else {
                         "desconhecido"
                     };
+                    // Nome vindo do cliente: limitado e escapado para não forjar linhas de log.
+                    let shown: String =
+                        kind.chars().take(32).flat_map(char::escape_debug).collect();
                     return Err(KavoError::UnsupportedType(format!(
-                        "tipo '{kind}' {reason}"
+                        "tipo \"{shown}\" {reason}"
                     )));
                 }
             }
@@ -211,12 +272,12 @@ impl KavoMessage {
 
 fn check_uuid(field: &str, value: &str) -> Result<()> {
     match Uuid::parse_str(value) {
-        Ok(uuid) if uuid.get_version() == Some(uuid::Version::Random) => Ok(()),
+        Ok(uuid) if uuid.get_version() == Some(Version::Random) => Ok(()),
         _ => Err(KavoError::Protocol(format!("{field} deve ser UUID v4"))),
     }
 }
 
-fn check_text(field: &str, value: &str, max: usize) -> Result<()> {
+pub(crate) fn check_text(field: &str, value: &str, max: usize) -> Result<()> {
     if value.is_empty() || value.chars().count() > max || value.chars().any(char::is_control) {
         return Err(KavoError::Protocol(format!(
             "{field} vazio, longo demais (máx. {max}) ou com caracteres de controle"

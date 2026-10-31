@@ -17,6 +17,29 @@ pub struct KavoConfig {
     pub runtime: RuntimeConfig,
     pub logging: LoggingConfig,
     pub ipc: IpcConfig,
+    pub speech: SpeechConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SpeechConfig {
+    /// Sem atividade por este tempo, um stream de STT é marcado como expirado.
+    /// Valor provisório: deve ser calibrado por medição.
+    pub stream_idle_timeout_ms: u64,
+    /// Streams simultâneos rastreados pelo monitor.
+    pub max_streams: usize,
+    /// Confiança mínima para admissão de intenção. `None` = sem limite (sem valor padrão medido).
+    pub min_confidence: Option<f32>,
+}
+
+impl Default for SpeechConfig {
+    fn default() -> Self {
+        Self {
+            stream_idle_timeout_ms: 10_000,
+            max_streams: 16,
+            min_confidence: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -132,6 +155,20 @@ impl KavoConfig {
         }
         if self.ipc.request_timeout_ms == 0 {
             return Err(invalid("ipc.request_timeout_ms", "deve ser maior que zero"));
+        }
+        if self.speech.stream_idle_timeout_ms == 0 {
+            return Err(invalid(
+                "speech.stream_idle_timeout_ms",
+                "deve ser maior que zero",
+            ));
+        }
+        if self.speech.max_streams == 0 {
+            return Err(invalid("speech.max_streams", "deve ser maior que zero"));
+        }
+        if let Some(c) = self.speech.min_confidence {
+            if !c.is_finite() || !(0.0..=1.0).contains(&c) {
+                return Err(invalid("speech.min_confidence", "deve estar em [0.0, 1.0]"));
+            }
         }
         if self.ipc.idle_timeout_ms == 0 {
             return Err(invalid("ipc.idle_timeout_ms", "deve ser maior que zero"));

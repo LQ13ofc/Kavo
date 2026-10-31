@@ -1,13 +1,14 @@
 # Kavo — fundação do núcleo (Fase 4.1)
 
 Núcleo em Rust: configuração, logging estruturado, erros, runtime supervisionado,
-**Kavo Protocol** v1.0-draft (NDJSON sobre Unix socket) e barramento interno.
+**Kavo Protocol** v1.1-draft (NDJSON sobre Unix socket) e barramento interno.
 Escopo: sem voz, wake word, STT, TTS, LLM, automação ou UI.
 
 ## Documentação
 
 - `docs/KAVO-PROTOCOL.md`: especificação do protocolo e reconciliação 03-PROTOCOLOS × 10-CONTRATOS.
 - `docs/ERROR-TAXONOMY.md`: classes de erro e códigos propostos.
+- `docs/SPEECH-INTENT-CONTRACTS.md`: contratos de STT streaming, Intent Engine e prontidão.
 - `docs/DECISIONS.md`: decisões com status (aprovada, provisória, pendente).
 
 ## Estrutura
@@ -17,7 +18,10 @@ Escopo: sem voz, wake word, STT, TTS, LLM, automação ou UI.
 | `config` | TOML + Serde; overrides `KAVO_*`; validação; caminhos XDG |
 | `logging` | `tracing` em stderr; JSON por padrão; `RUST_LOG` tem precedência |
 | `error` | `KavoError` e classes `ErrorKind` |
-| `protocol` | `KavoMessage`, tipos implementados, reservados, entrega, validação |
+| `protocol` | `KavoMessage` 1.1, tipos implementados, reservados, entrega, validação |
+| `speech` | contratos de STT streaming e `StreamTracker` (ordem, revisões, timeout) |
+| `intent` | contratos do Intent Engine, `InterpretationTracker` e `ReadinessGate` |
+| `monitor` | assinante do barramento que aplica os contratos (sem ações) |
 | `ipc` | NDJSON sobre Unix socket; limite de tamanho; prazo; cliente `ping` |
 | `bus` | barramento interno: filas mpsc por assinante; garantido vs. melhor esforço |
 | `runtime` | trait `Component`, `Supervisor`, `run` (SIGINT/SIGTERM) |
@@ -41,7 +45,7 @@ Socket: `$XDG_RUNTIME_DIR/kavo/kavo.sock` (0600; diretório 0700).
 ## Testes
 
 ```bash
-cargo test                          # 38 testes (unitários e integração)
+cargo test                          # 88 testes (unitários e integração)
 cargo clippy --all-targets          # 0 avisos
 ```
 
@@ -50,7 +54,9 @@ Testes E2E no computador real estão descritos em `docs/` e no relatório da fas
 
 ## Limitações
 
-- Protocolo sem STT, NLU, comandos ou memória; só HEARTBEAT, ERROR, CANCEL.
+- Sem mecanismo real de STT nem de NLU/JEV; só contratos e regras.
+- Sem Capability Registry, Policy Engine, Planner, Task Manager ou Execution Engine.
+- Protocolo: HEARTBEAT, ERROR, CANCEL, STT_RESULT, INTENT_DETECTED.
 - Barramento só em processo; sem Message Bus externo.
 - Código 1100 para quase todos os erros até a taxonomia ser aprovada.
 - Apenas Linux (Unix socket, flock).

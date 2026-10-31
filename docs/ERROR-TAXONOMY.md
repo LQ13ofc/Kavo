@@ -23,6 +23,8 @@ Cada erro interno (`KavoError`) tem uma classe `ErrorKind` com nome estável. O 
 | `IO` | falha de sistema de arquivos ou socket | 3004 | depende do caso |
 | `INTERNAL` | falha não classificada (reservada; nenhum erro atual cai aqui) | 1100 | registrar e investigar |
 
+Erros de STT (Phase 4.2): usar os códigos de domínio aprovados `1001 STT_AUDIO_ERROR` e `1002 STT_MODEL_ERROR` em `STREAM_FAILED`/`ERROR`. Classes propostas: `ENGINE_UNAVAILABLE` (1002), `STREAM_TIMEOUT` (2008). Ainda não aprovadas.
+
 Códigos 1001–1007 são de domínio (STT, intent, comando, memória, wake word) e não são usados pela fundação.
 
 ## 3. Regras

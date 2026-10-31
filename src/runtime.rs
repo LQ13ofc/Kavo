@@ -13,6 +13,7 @@ use crate::config::KavoConfig;
 use crate::error::{KavoError, Result};
 use crate::instance::InstanceLock;
 use crate::ipc::{IpcServer, IpcSettings};
+use crate::monitor::ContractMonitor;
 
 /// Recursos entregues a um componente ao iniciar.
 #[derive(Debug, Clone)]
@@ -142,7 +143,14 @@ pub async fn run(config: KavoConfig) -> Result<()> {
         signal(SignalKind::interrupt()).map_err(|e| KavoError::io("registrar SIGINT", e))?;
 
     let bus = EventBus::new(256, Duration::from_millis(config.ipc.request_timeout_ms));
+    // Assinatura criada antes do IPC aceitar conexões: nenhuma mensagem inicial se perde.
+    let monitor_rx = bus.subscribe();
     let mut supervisor = Supervisor::new(bus);
+    supervisor.spawn(ContractMonitor::new(
+        monitor_rx,
+        &config.speech,
+        Default::default(),
+    ));
     let server = IpcServer::bind(&socket, IpcSettings::from_config(&config))?;
     supervisor.spawn(server);
     info!(version = env!("CARGO_PKG_VERSION"), "Kavo em execução");
