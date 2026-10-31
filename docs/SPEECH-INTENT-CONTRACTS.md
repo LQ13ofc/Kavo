@@ -55,6 +55,8 @@ Após estado terminal, eventos novos são rejeitados. Reenvio idêntico do últi
 | `Gap { expected, got }` | faltam sequências | não aplicado. Não há sinal de volta ao produtor nesta versão; a lacuna fica no monitor (`speech_gap`). A atividade do produtor conta para o timeout. |
 | `Rejected(motivo)` | conteúdo ou estado inválido | sequência consumida; motivo registrado |
 
+Primeiro evento de um stream recusado por conteúdo (ex.: revisão inválida): a sequência é consumida, o stream permanece `OPEN` no banco e ativo na memória. `REJECTED` no banco só é gravado quando o stream não entra na memória (recusa por capacidade). Memória e banco sempre concordam sobre `ativo` ou `terminal`.
+
 Janela de duplicatas: últimas 64 sequências por stream. Comparação exata do conteúdo canônico (sem hash). Mesma sequência com conteúdo diferente é `Rejected`.
 
 Identidade do stream: `(session_id, stream_id)`. O mesmo `stream_id` em outra sessão é outro stream.
@@ -66,7 +68,6 @@ Aposentadoria (permanente no processo):
 
 Limites:
 - `speech.max_streams` (padrão 16). Ao atingir o limite, remove-se o terminal menos recente. Se todos estiverem ativos, o novo é rejeitado.
-- 256 segmentos por stream. Acima disso, `Rejected`.
 - 256 segmentos por stream. Acima disso, `Rejected`.
 
 ## 2. Intent Engine (`INTENT_DETECTED`)
@@ -130,7 +131,23 @@ Limite de confiança: sem valor padrão. Deve vir de medição (baseline).
 
 - `CANCEL` com `payload.stream_id` cancela o stream e marca as interpretações dele como `CANCELLED`. Admissões seguintes são bloqueadas por `NotReady(STREAM_INACTIVE)`.
 - `CANCEL` com `correlation_id` é alvo de requisição. Não há tarefas no núcleo, então só é registrado.
-- Cancelamento é idempotente: cancelar stream já encerrado retorna "não alterado".
+- **Transições terminais gravadas antes da memória.** `ENDED` e `FAILED` (evento `STREAM_ENDED`/`STREAM_FAILED`) e `TIMED_OUT` (expiração) só valem em memória depois que o SQLite confirma `close_stream`. Se a gravação falha: a memória fica como estava, a sequência do evento não é consumida (o produtor pode reenviar o mesmo evento) e a expiração tenta de novo no ciclo seguinte. Não existe estado terminal só na memória. Efeito colateral: enquanto a gravação falha, o log de expiração repete a cada 250 ms.
+- Como consequência, um `CANCEL` depois de falha de gravação de transição terminal age sobre um stream que o banco ainda marca `OPEN`, e é um cancelamento válido, não um no-op indevido. Após `ENDED`/`FAILED`/`TIMED_OUT` gravados, `CANCEL` é no-op.
+- Semântica de `CANCEL` por estado (decisão aprovada). A decisão é tomada dentro da transação `IMMEDIATE` do SQLite (`CancelOutcome`):
+
+| Estado atual | Resultado | Efeito durável |
+|---|---|---|
+| `OPEN` | `CANCELLED_OPEN` | stream → `CANCELLED`; interpretações → `cancelled = 1`; admissões `ADMITTED` → `CANCELLED`. Chaves nunca são liberadas |
+| `ENDED` | `ALREADY_TERMINAL` | no-op completo |
+| `CANCELLED` | `ALREADY_TERMINAL` | no-op idempotente |
+| `FAILED` | `ALREADY_TERMINAL` | no-op, estado preservado |
+| `TIMED_OUT` | `ALREADY_TERMINAL` | no-op, estado preservado |
+| `INTERRUPTED`, `REJECTED` | `ALREADY_TERMINAL` | no-op (estados terminais; não reabrem) |
+| desconhecido | `TOMBSTONED` | tombstone `CANCELLED`; o id não abre, nem após reinício |
+| falha de armazenamento | erro | rollback total; memória não muda |
+
+Em `ALREADY_TERMINAL`, nem a memória do stream nem as interpretações são tocadas.
+- **Sem confirmação ao produtor.** O protocolo não envia resposta a `CANCEL` (ver `KAVO-PROTOCOL.md`). Uma falha de gravação aparece só em log (`cancelamento não gravado; nada foi alterado`) e em `store_errors`. O produtor não recebe erro e não pode concluir sucesso ou falha a partir do protocolo. Enquanto não houver resposta, o efeito real do cancelamento deve ser verificado por consulta de estado no banco ou nos logs.
 
 ## 5. Monitor de contratos
 
@@ -149,9 +166,7 @@ Limite de confiança: sem valor padrão. Deve vir de medição (baseline).
 
 ## 7. Logs e mensagens de erro
 
-- Logs registram rótulos (`APPLIED`, `GAP`, `REJECTED`, `ADMIT`, ...), contadores, ids e impressões digitais da chave. Não registram texto transcrito, nome de capacidade nem valor de parâmetro.
-- Erros de validação dos payloads não ecoam valores enviados pelo produtor.
-- Nomes de tipo desconhecido são limitados a 32 caracteres e escapados antes de entrar em log e em `ERROR`.
+Ver §10 (regras atuais de logs e erros).
 
 ## 8. Lacunas e recuperação do produtor (Phase 4.2 final)
 
@@ -183,12 +198,12 @@ Semântica de admissão:
 
 Supersede: a chave anterior permanece consumida. Se a intenção antiga voltar, é `AlreadyAdmitted`, nunca reexecutada.
 
-Semântica de cancelamento: `CANCEL` de stream grava, em uma transação, o stream como `CANCELLED`, as interpretações como `cancelled` e as admissões do stream como `CANCELLED`. As chaves continuam consumidas. Um id desconhecido cancelado vira aposentado (`CANCELLED` sem `OPEN`).
+Semântica de cancelamento: `CANCEL` de stream grava, em uma transação, o stream como `CANCELLED`, as interpretações como `cancelled` e as admissões do stream como `CANCELLED`. As chaves continuam consumidas. Um id desconhecido cancelado vira aposentado (`CANCELLED` sem `OPEN`). Gravar vem antes da memória: se a gravação do cancelamento falhar, nada muda em memória e a falha é registrada. Abertura de stream e tombstone usam `ON CONFLICT(session_id, stream_id) DO NOTHING` e confirmam o efeito pela linha existente: constraint inesperada, trigger `RAISE(IGNORE)` ou inserção sem efeito são erro, nunca duplicidade.
 
 Identidade no reinício:
 - Todo stream já gravado é aposentado. Um stream que estava `OPEN` no reinício vira `INTERRUPTED` e nunca é retomado. O produtor deve iniciar um stream novo com `stream_id` novo.
-- Revisões antigas são rejeitadas (`Stale`) porque as revisões estão no banco.
-- Admissões são restauradas. Reenvio nunca executa de novo.
+- Revisões antigas são rejeitadas (`Stale`) porque as revisões estão no banco. A gravação de interpretação é monotônica no SQLite (M1): revisão menor não altera a linha; revisão igual só é aceita com o mesmo conteúdo (reenvio idêntico, `Unchanged`); revisão igual com conteúdo diferente, mudança de stream/segmento, regressão de `source_revision` ou revisão após cancelamento é `Conflict`. Nenhuma dessas altera o digest durável, mesmo depois de reinício ou de a memória ter sido esquecida.
+- Admissões são restauradas. Um reenvio da mesma chave é recusado como `AlreadyAdmitted` ou `Duplicate`, sem nova admissão.
 
 Falhas:
 - Banco corrompido, esquema desconhecido ou tabela ausente: o núcleo não inicia (fail-closed).
@@ -207,9 +222,11 @@ Limitações restantes:
 
 ## 10. Logs e mensagens de erro
 
+- Logs e erros: ver regras abaixo (B1, B2).
+- Chave de admissão: só `PRIMARY KEY`/`UNIQUE` contam como consumo (`AlreadyConsumed`). Outra constraint, ou inserção sem efeito (ex.: trigger `RAISE(IGNORE)`), é erro de armazenamento, nunca duplicidade (B2).
+
 - Logs registram rótulos (`APPLIED`, `GAP`, `REJECTED`, `ADMIT`, ...), contadores, ids e impressão curta da chave (12 caracteres do digest). Não registram texto transcrito, nome de capacidade nem valor de parâmetro.
-- Erros de validação dos payloads não ecoam valores enviados pelo produtor.
-- Nomes de tipo desconhecido são limitados a 32 caracteres e escapados antes de entrar em log e em `ERROR`.
+- Nenhum valor enviado pelo cliente aparece em logs ou em `ERROR` (B1). Erros de serde são descritos só por categoria e coluna. Tipo desconhecido é recusado sem ecoar o nome. Versão recusada não é ecoada.
 
 ## 11. Riscos conhecidos da persistência síncrona (não corrigidos)
 
@@ -218,3 +235,16 @@ Limitações restantes:
 - `busy_timeout` = 5 s. Um segundo escritor (outro processo) pode bloquear a tarefa por até esse tempo.
 - `quick_check` roda a cada inicialização. Em banco grande, o início pode demorar.
 - Não medido. A correção natural é mover as gravações para `spawn_blocking` ou para um escritor dedicado com fila, mantendo a ordem. Pendente de decisão.
+
+## 12. Garantias e limites da admissão (M2)
+
+O que está implementado:
+- A chave de admissão é consumida de forma durável e única por `(session_id, execution_key)`. A unicidade é imposta pelo SQLite (`PRIMARY KEY`), dentro de transação `BEGIN IMMEDIATE`.
+- `ADMIT` só é registrado depois do `COMMIT`. Falha de gravação não admite.
+- Revisões de interpretação são monotônicas na durável: revisão menor, ou igual com conteúdo diferente, não altera a linha gravada (ver §9).
+
+O que NÃO está implementado e não deve ser tomado como garantia:
+- Não há Execution Engine. `ADMIT` é uma decisão durável, não uma ação executada.
+- Não há outbox nem verificação do efeito da ação. Não há como saber se algo foi feito no mundo real.
+- A semântica atual é de **admissão at-most-once**: uma chave é consumida antes de qualquer execução. Se um executor futuro cair depois do `COMMIT`, a ação não é retentada automaticamente.
+- Execução exatamente uma vez, execução at-least-once e a recuperação após falha do executor não estão garantidas. Essa semântica deve ser decidida antes da implementação do executor.

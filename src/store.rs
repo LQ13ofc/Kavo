@@ -71,11 +71,59 @@ pub struct AdmissionRow {
     pub interpretation: InterpretationRow,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitOutcome {
     Committed,
     /// A chave já foi admitida nesta sessão (em qualquer momento anterior). Nada foi gravado.
     AlreadyConsumed,
+    /// A revisão da interpretação é antiga ou conflita com a gravada. Nada foi gravado.
+    /// Carrega a linha durável vigente, para o monitor restaurar sua memória.
+    InterpretationRejected(InterpretationRow),
+}
+
+/// Resultado de `cancel_stream` (decisão tomada dentro da transação do SQLite).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// Stream `OPEN` cancelado, com interpretações e admissões associadas.
+    CancelledOpen,
+    /// Id desconhecido: tombstone `CANCELLED` gravado. O id nunca mais abre.
+    Tombstoned,
+    /// Stream já em estado terminal (`ENDED`, `CANCELLED`, `FAILED`, `TIMED_OUT`, `INTERRUPTED`,
+    /// `REJECTED`). Nenhuma linha foi alterada. Carrega o status preservado.
+    AlreadyTerminal(String),
+}
+
+impl CancelOutcome {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::CancelledOpen => "CANCELLED_OPEN",
+            Self::Tombstoned => "TOMBSTONED",
+            Self::AlreadyTerminal(_) => "ALREADY_TERMINAL",
+        }
+    }
+}
+
+/// Resultado da gravação monotônica de uma interpretação (M1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterpWrite {
+    /// Primeira revisão desta interpretação.
+    Inserted,
+    /// Revisão nova e maior, aceita.
+    Updated,
+    /// Mesma revisão e mesmo conteúdo: reenvio legítimo. Nada mudou.
+    Unchanged,
+    /// Revisão menor que a gravada. Nada mudou. Carrega a linha vigente.
+    Stale(InterpretationRow),
+    /// Mesma revisão com conteúdo diferente, ou mudança de stream/segmento/origem, ou
+    /// revisão posterior a interpretação cancelada. Nada mudou. Carrega a linha vigente.
+    Conflict(InterpretationRow),
+}
+
+/// Resultado do `INSERT` da chave de admissão.
+enum KeyInsert {
+    Inserted,
+    /// Violação PRIMARY KEY/UNIQUE: chave já consumida nesta sessão. É o único conflito legítimo.
+    Consumed,
 }
 
 /// Estado restaurado ao iniciar.
@@ -298,25 +346,53 @@ impl Store {
         Ok(snap)
     }
 
-    /// Registra o início de um stream. `Ok(false)` se o id já existe (não reabre).
+    /// Registra o início de um stream, em transação `IMMEDIATE`.
+    ///
+    /// `Ok(true)`: inserido agora. `Ok(false)`: a PK `(session_id, stream_id)` já existia, com
+    /// qualquer status (duplicidade legítima). Erro: qualquer outra falha, inclusive inserção sem
+    /// efeito (trigger `RAISE(IGNORE)`), que nunca é tratada como duplicidade.
     pub fn open_stream(&mut self, session: &str, stream: &Uuid, now_ms: i64) -> Result<bool> {
-        let changed = self
+        let tx = self
             .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| db_err("iniciar abertura de stream", e))?;
+        let id = stream.to_string();
+        // ON CONFLICT com alvo explícito: só a PK (session_id, stream_id) é ignorada.
+        let changed = tx
             .execute(
-                "INSERT OR IGNORE INTO streams (session_id, stream_id, status, opened_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    session,
-                    stream.to_string(),
-                    StreamDbStatus::Open.as_str(),
-                    now_ms
-                ],
+                "INSERT INTO streams (session_id, stream_id, status, opened_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(session_id, stream_id) DO NOTHING",
+                params![session, id, StreamDbStatus::Open.as_str(), now_ms],
             )
             .map_err(|e| db_err("abrir stream", e))?;
-        Ok(changed == 1)
+        let inserted = match changed {
+            1 => true,
+            0 => {
+                // Sem linha afetada: a PK já existia, ou algo ignorou a inserção.
+                let existing = stream_status_tx(&tx, session, &id)?;
+                if existing.is_none() {
+                    return Err(KavoError::Store(
+                        "inserção de stream sem efeito e sem linha existente".to_owned(),
+                    ));
+                }
+                false
+            }
+            n => {
+                return Err(KavoError::Store(format!(
+                    "inserção de stream afetou {n} linhas (esperado 0 ou 1)"
+                )));
+            }
+        };
+        tx.commit()
+            .map_err(|e| db_err("commit abertura de stream", e))?;
+        Ok(inserted)
     }
 
-    /// Fecha um stream com estado terminal. Só altera se ainda estiver `OPEN`.
+    /// Fecha um stream com estado terminal, em transação `IMMEDIATE`.
+    ///
+    /// Só `OPEN` vira terminal. Exige exatamente uma linha afetada: linha ausente ou já terminal é
+    /// erro, nunca sucesso silencioso. Quem chama só muda a memória depois de `Ok`.
     pub fn close_stream(
         &mut self,
         session: &str,
@@ -324,7 +400,16 @@ impl Store {
         status: StreamDbStatus,
         now_ms: i64,
     ) -> Result<()> {
-        self.conn
+        if status == StreamDbStatus::Open {
+            return Err(KavoError::Store(
+                "transição terminal não pode ser OPEN".to_owned(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| db_err("iniciar fechamento de stream", e))?;
+        let changed = tx
             .execute(
                 "UPDATE streams SET status = ?3, closed_at_ms = ?4
                  WHERE session_id = ?1 AND stream_id = ?2 AND status = ?5",
@@ -337,53 +422,105 @@ impl Store {
                 ],
             )
             .map_err(|e| db_err("fechar stream", e))?;
+        if changed != 1 {
+            let present = stream_status_tx(&tx, session, &stream.to_string())?;
+            return Err(KavoError::Store(format!(
+                "fechamento de stream afetou {changed} linhas (estado atual: {})",
+                present.as_deref().unwrap_or("ausente")
+            )));
+        }
+        tx.commit()
+            .map_err(|e| db_err("commit fechamento de stream", e))?;
         Ok(())
     }
 
-    /// Cancela um stream: marca o stream, suas interpretações e suas admissões. Atômico.
-    /// Se o stream não existir, grava um aposentado `CANCELLED` (ele não poderá começar depois).
-    pub fn cancel_stream(&mut self, session: &str, stream: &Uuid, now_ms: i64) -> Result<()> {
+    /// Cancela um stream em transação `IMMEDIATE`. A decisão é tomada no SQLite, não na memória.
+    ///
+    /// - `OPEN`: vira `CANCELLED`; interpretações ficam `cancelled`; admissões `ADMITTED` viram `CANCELLED`.
+    /// - Desconhecido: grava tombstone `CANCELLED` (o id nunca mais abre, nem após reinício).
+    /// - Qualquer outro estado (`ENDED`, `CANCELLED`, `FAILED`, `TIMED_OUT`, `INTERRUPTED`, `REJECTED`):
+    ///   no-op completo. Nenhuma linha é alterada.
+    /// - Falha: erro, com rollback. Nenhum estado parcial.
+    pub fn cancel_stream(
+        &mut self,
+        session: &str,
+        stream: &Uuid,
+        now_ms: i64,
+    ) -> Result<CancelOutcome> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| db_err("iniciar cancelamento", e))?;
         let id = stream.to_string();
-        tx.execute(
-            "INSERT OR IGNORE INTO streams (session_id, stream_id, status, opened_at_ms, closed_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?4)",
-            params![session, id, StreamDbStatus::Cancelled.as_str(), now_ms],
-        )
-        .map_err(|e| db_err("tombstone de cancelamento", e))?;
-        tx.execute(
-            "UPDATE streams SET status = ?3, closed_at_ms = ?4
-             WHERE session_id = ?1 AND stream_id = ?2 AND status = ?5",
-            params![
-                session,
-                id,
-                StreamDbStatus::Cancelled.as_str(),
-                now_ms,
-                StreamDbStatus::Open.as_str()
-            ],
-        )
-        .map_err(|e| db_err("cancelar stream", e))?;
-        tx.execute(
-            "UPDATE interpretations SET cancelled = 1 WHERE session_id = ?1 AND stream_id = ?2",
-            params![session, id],
-        )
-        .map_err(|e| db_err("cancelar interpretações", e))?;
-        tx.execute(
-            "UPDATE segment_admission SET status = 'CANCELLED', updated_at_ms = ?3
-             WHERE session_id = ?1 AND stream_id = ?2 AND status = 'ADMITTED'",
-            params![session, id, now_ms],
-        )
-        .map_err(|e| db_err("cancelar admissões", e))?;
+        let outcome = match stream_status_tx(&tx, session, &id)? {
+            None => {
+                let changed = tx
+                    .execute(
+                        "INSERT INTO streams (session_id, stream_id, status, opened_at_ms, closed_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?4)
+                         ON CONFLICT(session_id, stream_id) DO NOTHING",
+                        params![session, id, StreamDbStatus::Cancelled.as_str(), now_ms],
+                    )
+                    .map_err(|e| db_err("tombstone de cancelamento", e))?;
+                if changed != 1 {
+                    return Err(KavoError::Store(format!(
+                        "tombstone afetou {changed} linhas (esperado 1)"
+                    )));
+                }
+                CancelOutcome::Tombstoned
+            }
+            Some(status) if status == StreamDbStatus::Open.as_str() => {
+                let changed = tx
+                    .execute(
+                        "UPDATE streams SET status = ?3, closed_at_ms = ?4
+                         WHERE session_id = ?1 AND stream_id = ?2 AND status = ?5",
+                        params![
+                            session,
+                            id,
+                            StreamDbStatus::Cancelled.as_str(),
+                            now_ms,
+                            StreamDbStatus::Open.as_str()
+                        ],
+                    )
+                    .map_err(|e| db_err("cancelar stream", e))?;
+                if changed != 1 {
+                    return Err(KavoError::Store(format!(
+                        "cancelamento de stream afetou {changed} linhas (esperado 1)"
+                    )));
+                }
+                tx.execute(
+                    "UPDATE interpretations SET cancelled = 1 WHERE session_id = ?1 AND stream_id = ?2",
+                    params![session, id],
+                )
+                .map_err(|e| db_err("cancelar interpretações", e))?;
+                tx.execute(
+                    "UPDATE segment_admission SET status = 'CANCELLED', updated_at_ms = ?3
+                     WHERE session_id = ?1 AND stream_id = ?2 AND status = 'ADMITTED'",
+                    params![session, id, now_ms],
+                )
+                .map_err(|e| db_err("cancelar admissões", e))?;
+                CancelOutcome::CancelledOpen
+            }
+            Some(status) => CancelOutcome::AlreadyTerminal(status),
+        };
         tx.commit().map_err(|e| db_err("commit cancelamento", e))?;
-        Ok(())
+        Ok(outcome)
     }
 
     /// Grava ou atualiza uma interpretação (sem admissão).
-    pub fn upsert_interpretation(&mut self, row: &InterpretationRow, now_ms: i64) -> Result<()> {
-        upsert_interp(&self.conn, row, now_ms).map_err(|e| db_err("gravar interpretação", e))
+    /// Grava uma revisão de interpretação somente se ela avança a durável. Atômico.
+    pub fn upsert_interpretation(
+        &mut self,
+        row: &InterpretationRow,
+        now_ms: i64,
+    ) -> Result<InterpWrite> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| db_err("iniciar interpretação", e))?;
+        let outcome = guarded_write(&tx, row, now_ms)?;
+        tx.commit().map_err(|e| db_err("commit interpretação", e))?;
+        Ok(outcome)
     }
 
     /// Admissão atômica: consome a chave, troca o ponteiro do segmento e grava a interpretação.
@@ -393,10 +530,17 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| db_err("iniciar admissão", e))?;
-        match insert_key(&tx, adm, now_ms) {
-            Ok(true) => {}
-            Ok(false) => return Ok(CommitOutcome::AlreadyConsumed),
-            Err(e) => return Err(db_err("consumir chave", e)),
+        // Primeiro a interpretação: se for rejeitada, a chave não é consumida.
+        // Se a chave for consumida depois, o `return` abaixo descarta a transação inteira (rollback).
+        match guarded_write(&tx, &adm.interpretation, now_ms)? {
+            InterpWrite::Inserted | InterpWrite::Updated | InterpWrite::Unchanged => {}
+            InterpWrite::Stale(stored) | InterpWrite::Conflict(stored) => {
+                return Ok(CommitOutcome::InterpretationRejected(stored));
+            }
+        }
+        match insert_key(&tx, adm, now_ms)? {
+            KeyInsert::Inserted => {}
+            KeyInsert::Consumed => return Ok(CommitOutcome::AlreadyConsumed),
         }
         tx.execute(
             "INSERT INTO segment_admission
@@ -416,8 +560,6 @@ impl Store {
             ],
         )
         .map_err(|e| db_err("gravar segmento", e))?;
-        upsert_interp(&tx, &adm.interpretation, now_ms)
-            .map_err(|e| db_err("gravar interpretação", e))?;
         tx.commit().map_err(|e| db_err("commit admissão", e))?;
         Ok(CommitOutcome::Committed)
     }
@@ -463,9 +605,10 @@ impl Store {
     }
 }
 
-fn insert_key(tx: &Transaction<'_>, adm: &AdmissionRow, now_ms: i64) -> rusqlite::Result<bool> {
-    let changed = tx.execute(
-        "INSERT OR IGNORE INTO admission_keys
+/// Insere a chave. Só PRIMARY KEY/UNIQUE é tratado como consumo; qualquer outra constraint é erro.
+fn insert_key(tx: &Transaction<'_>, adm: &AdmissionRow, now_ms: i64) -> Result<KeyInsert> {
+    let result = tx.execute(
+        "INSERT INTO admission_keys
             (session_id, execution_key, segment_id, stream_id, interpretation_id, intent, admitted_at_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
@@ -477,8 +620,100 @@ fn insert_key(tx: &Transaction<'_>, adm: &AdmissionRow, now_ms: i64) -> rusqlite
             adm.intent,
             now_ms
         ],
-    )?;
-    Ok(changed == 1)
+    );
+    match result {
+        // Exatamente uma linha: a única forma de admissão válida.
+        Ok(1) => Ok(KeyInsert::Inserted),
+        // Sucesso sem linha (ex.: trigger RAISE(IGNORE)): nunca é admissão.
+        Ok(n) => Err(KavoError::Store(format!(
+            "inserção de chave sem efeito ({n} linhas afetadas)"
+        ))),
+        Err(rusqlite::Error::SqliteFailure(err, _))
+            if err.code == rusqlite::ErrorCode::ConstraintViolation
+                && matches!(
+                    err.extended_code,
+                    rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                        | rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                ) =>
+        {
+            Ok(KeyInsert::Consumed)
+        }
+        Err(rusqlite::Error::SqliteFailure(err, _))
+            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            // Outra constraint (NOT NULL, CHECK, TRIGGER, FK): inesperada. Nunca vira "duplicidade".
+            Err(KavoError::Store(format!(
+                "violação de constraint inesperada ao consumir chave (código {})",
+                err.extended_code
+            )))
+        }
+        Err(e) => Err(db_err("consumir chave", e)),
+    }
+}
+
+/// Gravação monotônica de uma interpretação, dentro de uma transação já aberta.
+///
+/// Regras (M1): uma revisão só entra se for maior que a gravada; igual só é aceita com o mesmo
+/// conteúdo (reenvio legítimo); menor ou conflitante nunca altera a linha durável.
+fn guarded_write(conn: &Connection, row: &InterpretationRow, now_ms: i64) -> Result<InterpWrite> {
+    let stored = read_interp(conn, &row.session_id, &row.interpretation_id)
+        .map_err(|e| db_err("ler interpretação", e))?;
+    let Some(s) = stored else {
+        upsert_interp(conn, row, now_ms).map_err(|e| db_err("gravar interpretação", e))?;
+        return Ok(InterpWrite::Inserted);
+    };
+    if s.stream_id != row.stream_id || s.segment_id != row.segment_id {
+        return Ok(InterpWrite::Conflict(s));
+    }
+    if row.revision < s.revision {
+        return Ok(InterpWrite::Stale(s));
+    }
+    if row.revision == s.revision {
+        return Ok(
+            if s.content_digest == row.content_digest && s.source_revision == row.source_revision {
+                InterpWrite::Unchanged
+            } else {
+                InterpWrite::Conflict(s)
+            },
+        );
+    }
+    // Revisão maior: só se a origem não regrediu e a interpretação não foi cancelada.
+    if s.cancelled || row.source_revision < s.source_revision {
+        return Ok(InterpWrite::Conflict(s));
+    }
+    upsert_interp(conn, row, now_ms).map_err(|e| db_err("gravar interpretação", e))?;
+    Ok(InterpWrite::Updated)
+}
+
+fn read_interp(
+    conn: &Connection,
+    session: &str,
+    interpretation: &Uuid,
+) -> rusqlite::Result<Option<InterpretationRow>> {
+    conn.query_row(
+        "SELECT stream_id, segment_id, revision, source_revision, content_digest, cancelled
+         FROM interpretations WHERE session_id = ?1 AND interpretation_id = ?2",
+        params![session, interpretation.to_string()],
+        |r| {
+            Ok(InterpretationRow {
+                session_id: session.to_owned(),
+                interpretation_id: *interpretation,
+                stream_id: parse_uuid_sql(&r.get::<_, String>(0)?)?,
+                segment_id: parse_uuid_sql(&r.get::<_, String>(1)?)?,
+                revision: r.get(2)?,
+                source_revision: r.get(3)?,
+                content_digest: r.get(4)?,
+                cancelled: r.get(5)?,
+            })
+        },
+    )
+    .optional()
+}
+
+fn parse_uuid_sql(text: &str) -> rusqlite::Result<Uuid> {
+    Uuid::parse_str(text).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
 }
 
 fn upsert_interp(conn: &Connection, row: &InterpretationRow, now_ms: i64) -> rusqlite::Result<()> {
@@ -506,6 +741,17 @@ fn upsert_interp(conn: &Connection, row: &InterpretationRow, now_ms: i64) -> rus
         ],
     )?;
     Ok(())
+}
+
+/// Status de um stream dentro de uma transação já aberta.
+fn stream_status_tx(tx: &Transaction<'_>, session: &str, id: &str) -> Result<Option<String>> {
+    tx.query_row(
+        "SELECT status FROM streams WHERE session_id = ?1 AND stream_id = ?2",
+        params![session, id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| db_err("ler status do stream", e))
 }
 
 fn parse_uuid(text: &str) -> Result<Uuid> {

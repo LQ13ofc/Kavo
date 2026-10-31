@@ -101,8 +101,12 @@ pub struct InterpretationPayload {
 
 impl InterpretationPayload {
     pub fn from_value(value: &serde_json::Value) -> Result<Self> {
-        let payload: Self = serde_json::from_value(value.clone())
-            .map_err(|e| KavoError::Protocol(format!("payload INTENT inválido: {e}")))?;
+        let payload: Self = serde_json::from_value(value.clone()).map_err(|e| {
+            KavoError::Protocol(format!(
+                "payload INTENT inválido ({})",
+                crate::protocol::describe_serde(&e)
+            ))
+        })?;
         payload.validate()?;
         Ok(payload)
     }
@@ -446,6 +450,8 @@ pub enum NotReadyReason {
     AlreadyAdmitted,
     /// Gravação durável indisponível: nada foi admitido.
     StoreUnavailable,
+    /// Revisão antiga ou conflitante com a gravada: nada foi alterado.
+    StaleRevision,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

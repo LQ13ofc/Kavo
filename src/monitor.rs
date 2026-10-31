@@ -21,8 +21,12 @@ use crate::intent::{
 };
 use crate::protocol::{KavoMessage, MessageType};
 use crate::runtime::{Component, ComponentContext};
-use crate::speech::{Acceptance, CancelPayload, SpeechPayload, StreamStatus, StreamTracker};
-use crate::store::{AdmissionRow, CommitOutcome, Store, StreamDbStatus};
+use crate::speech::{
+    Acceptance, CancelPayload, SpeechPayload, StreamStatus, StreamTracker, TerminalTransition,
+};
+use crate::store::{
+    AdmissionRow, CancelOutcome, CommitOutcome, InterpWrite, Store, StreamDbStatus,
+};
 
 const IDLE_CHECK_PERIOD: Duration = Duration::from_millis(250);
 
@@ -65,16 +69,6 @@ fn wall_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
-}
-
-fn db_status(status: &StreamStatus) -> Option<StreamDbStatus> {
-    match status {
-        StreamStatus::Active => None,
-        StreamStatus::Ended => Some(StreamDbStatus::Ended),
-        StreamStatus::Cancelled => Some(StreamDbStatus::Cancelled),
-        StreamStatus::Failed(_) => Some(StreamDbStatus::Failed),
-        StreamStatus::TimedOut => Some(StreamDbStatus::TimedOut),
-    }
 }
 
 impl ContractMonitor {
@@ -165,15 +159,44 @@ impl ContractMonitor {
             }
         }
 
-        let before = self.speech.status(session, &stream).cloned();
         let now = self.now_ms();
-        let outcome = self.speech.apply(session, &payload, now);
+        // Transição terminal: o SQLite confirma primeiro; só então a memória muda (ver `apply_with`).
+        let applied = {
+            let store = &mut self.store;
+            let mut persist = |t: &TerminalTransition| -> Result<()> {
+                let status = match t {
+                    TerminalTransition::Ended => StreamDbStatus::Ended,
+                    TerminalTransition::Failed(_) => StreamDbStatus::Failed,
+                };
+                store.close_stream(session, &stream, status, wall_ms())
+            };
+            self.speech.apply_with(session, &payload, now, &mut persist)
+        };
+        let outcome = match applied {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // Nada mudou: nem memória, nem sequência. O produtor pode reenviar o mesmo evento.
+                warn!(
+                    classe = e.kind().as_str(),
+                    "transição terminal não gravada; estado anterior preservado"
+                );
+                self.bump(|s| s.store_errors += 1);
+                return;
+            }
+        };
 
-        if opening && outcome != Acceptance::Applied {
-            // Gravado mas não aceito: fecha como rejeitado, para que o id não fique "aberto" no banco.
+        // Só fecha como REJECTED se o stream NÃO entrou na memória (recusa por capacidade).
+        // Se entrou, a memória o mantém ativo e o banco precisa continuar OPEN.
+        if opening && self.speech.status(session, &stream).is_none() {
             self.persist_status(session, &stream, StreamDbStatus::Rejected);
         }
-        self.persist_transition(session, &stream, before.as_ref());
+        if self
+            .speech
+            .status(session, &stream)
+            .is_some_and(StreamStatus::is_terminal)
+        {
+            self.interpretations.forget_stream(session, &stream);
+        }
 
         self.bump(|s| match &outcome {
             Acceptance::Applied => s.speech_applied += 1,
@@ -214,10 +237,30 @@ impl ContractMonitor {
             Acceptance::Applied => {
                 self.bump(|s| s.interpretation_applied += 1);
                 let row = InterpretationTracker::row_for(session, &payload);
-                // Falha aqui não admite nada: a admissão grava a interpretação na própria transação.
-                if let Err(e) = self.store.upsert_interpretation(&row, wall_ms()) {
-                    warn!(classe = e.kind().as_str(), "interpretação não gravada");
-                    self.bump(|s| s.store_errors += 1);
+                // A durável decide. A memória pode estar esquecida (stream terminal), então não basta.
+                match self.store.upsert_interpretation(&row, wall_ms()) {
+                    Ok(InterpWrite::Inserted | InterpWrite::Updated) => {}
+                    Ok(InterpWrite::Unchanged) => {
+                        self.bump(|s| s.interpretation_duplicate += 1);
+                        debug!(interpretation_id = %payload.interpretation_id, "reenvio idêntico da interpretação");
+                        return;
+                    }
+                    Ok(InterpWrite::Stale(stored) | InterpWrite::Conflict(stored)) => {
+                        // Restaura a memória com o que está gravado e recusa a revisão.
+                        self.interpretations.restore([stored]);
+                        self.bump(|s| s.interpretation_rejected += 1);
+                        warn!(interpretation_id = %payload.interpretation_id, resultado = "STALE_OR_CONFLICT", "revisão de interpretação recusada pela durável");
+                        return;
+                    }
+                    Err(e) => {
+                        // Fail-closed: sem gravação da revisão, nada é avaliado para admissão.
+                        warn!(classe = e.kind().as_str(), "interpretação não gravada");
+                        self.bump(|s| {
+                            s.store_errors += 1;
+                            s.not_ready += 1;
+                        });
+                        return;
+                    }
                 }
             }
             Acceptance::Duplicate => {
@@ -270,6 +313,10 @@ impl ContractMonitor {
                     Ok(CommitOutcome::AlreadyConsumed) => {
                         Decision::NotReady(NotReadyReason::AlreadyAdmitted)
                     }
+                    Ok(CommitOutcome::InterpretationRejected(stored)) => {
+                        self.interpretations.restore([stored]);
+                        Decision::NotReady(NotReadyReason::StaleRevision)
+                    }
                     Err(e) => {
                         warn!(
                             classe = e.kind().as_str(),
@@ -316,25 +363,36 @@ impl ContractMonitor {
         match CancelPayload::from_value(value) {
             Ok(cancel) => {
                 let session = msg.session_id.as_str();
-                let before = self.speech.status(session, &cancel.stream_id).cloned();
-                // Persistido antes da memória. Se falhar, a memória ainda bloqueia nesta execução,
-                // e no reinício o stream fica INTERRUPTED: nada é retomado.
-                if let Err(e) = self
+                // A decisão é do SQLite: a memória só segue o resultado persistido.
+                let outcome = match self
                     .store
                     .cancel_stream(session, &cancel.stream_id, wall_ms())
                 {
-                    warn!(classe = e.kind().as_str(), "cancelamento não gravado");
-                    self.bump(|s| s.store_errors += 1);
-                }
-                let changed = self.speech.cancel(session, &cancel.stream_id);
-                let interps = self
-                    .interpretations
-                    .cancel_stream(session, &cancel.stream_id);
-                info!(stream_id = %cancel.stream_id, alterado = changed, interpretacoes = interps, "CANCEL de stream");
-                if let Some(status) = self.speech.status(session, &cancel.stream_id).cloned() {
-                    if before.as_ref().is_none_or(|b| !b.is_terminal()) && status.is_terminal() {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        warn!(
+                            classe = e.kind().as_str(),
+                            "cancelamento não gravado; nada foi alterado"
+                        );
+                        self.bump(|st| st.store_errors += 1);
+                        return;
+                    }
+                };
+                info!(stream_id = %cancel.stream_id, resultado = outcome.label(), "CANCEL de stream");
+                match outcome {
+                    CancelOutcome::CancelledOpen => {
+                        self.speech.cancel(session, &cancel.stream_id);
+                        self.interpretations
+                            .cancel_stream(session, &cancel.stream_id);
                         self.interpretations
                             .forget_stream(session, &cancel.stream_id);
+                    }
+                    CancelOutcome::Tombstoned => {
+                        // Id desconhecido: aposentado também na memória, para não abrir nesta execução.
+                        self.speech.cancel(session, &cancel.stream_id);
+                    }
+                    CancelOutcome::AlreadyTerminal(_) => {
+                        // No-op completo: nem a memória do stream nem as interpretações são tocadas.
                     }
                 }
             }
@@ -347,37 +405,31 @@ impl ContractMonitor {
 
     fn expire_idle(&mut self) {
         let now = self.now_ms();
-        for (session, stream) in self.speech.expire_idle(now, self.idle_timeout_ms) {
+        for key in self.speech.idle_candidates(now, self.idle_timeout_ms) {
+            let (session, stream) = (key.0.clone(), key.1);
+            // Grava TIMED_OUT antes de marcar a memória. Falha: segue ativo nos dois lados e tenta de novo.
+            if let Err(e) =
+                self.store
+                    .close_stream(&session, &stream, StreamDbStatus::TimedOut, wall_ms())
+            {
+                warn!(
+                    classe = e.kind().as_str(),
+                    "expiração não gravada; stream segue ativo"
+                );
+                self.bump(|s| s.store_errors += 1);
+                continue;
+            }
+            self.speech.mark_timed_out(&key);
             self.bump(|s| s.streams_timed_out += 1);
             warn!(stream_id = %stream, "stream expirado por inatividade");
-            self.persist_status(&session, &stream, StreamDbStatus::TimedOut);
             self.interpretations.forget_stream(&session, &stream);
         }
     }
 
-    /// Grava a transição para estado terminal, se houve uma.
-    fn persist_transition(&mut self, session: &str, stream: &Uuid, before: Option<&StreamStatus>) {
-        let Some(after) = self.speech.status(session, stream).cloned() else {
-            return;
-        };
-        let was_terminal = before.is_some_and(StreamStatus::is_terminal);
-        if !was_terminal {
-            if let Some(status) = db_status(&after) {
-                self.persist_status(session, stream, status);
-                if after.is_terminal() {
-                    self.interpretations.forget_stream(session, stream);
-                }
-            }
-        }
-    }
-
+    /// Grava um estado terminal que não altera a memória (ex.: abertura recusada).
     fn persist_status(&mut self, session: &str, stream: &Uuid, status: StreamDbStatus) {
         if let Err(e) = self.store.close_stream(session, stream, status, wall_ms()) {
-            // Em memória o stream já está terminal; no banco continua OPEN e vira INTERRUPTED no reinício.
-            warn!(
-                classe = e.kind().as_str(),
-                "estado final do stream não gravado"
-            );
+            warn!(classe = e.kind().as_str(), "estado de recusa não gravado");
             self.bump(|s| s.store_errors += 1);
         }
     }

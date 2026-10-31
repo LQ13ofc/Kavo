@@ -193,10 +193,9 @@ impl KavoMessage {
                 major == "1" && !minor.is_empty() && minor.bytes().all(|b| b.is_ascii_digit())
             });
         if !version_ok {
-            return Err(KavoError::UnsupportedVersion(format!(
-                "schema_version '{}' incompatível (suportado: 1.x)",
-                self.schema_version
-            )));
+            return Err(KavoError::UnsupportedVersion(
+                "schema_version incompatível (suportado: 1.x)".to_owned(),
+            ));
         }
         check_uuid("message_id", &self.message_id)?;
         if let Some(id) = &self.correlation_id {
@@ -214,8 +213,8 @@ impl KavoMessage {
         // Tipos 1.1 e payload exigem schema 1.1. Mensagem 1.0 com eles é recusada, não interpretada.
         if (self.kind.requires_minor_1_1() || self.payload.is_some()) && self.minor() < 1 {
             return Err(KavoError::UnsupportedVersion(format!(
-                "{:?} com payload exige schema_version 1.1 (recebido {})",
-                self.kind, self.schema_version
+                "{:?} com payload exige schema_version 1.1",
+                self.kind
             )));
         }
 
@@ -286,17 +285,16 @@ impl KavoMessage {
                     } else {
                         "desconhecido"
                     };
-                    // Nome vindo do cliente: limitado e escapado para não forjar linhas de log.
-                    let shown: String =
-                        kind.chars().take(32).flat_map(char::escape_debug).collect();
-                    return Err(KavoError::UnsupportedType(format!(
-                        "tipo \"{shown}\" {reason}"
-                    )));
+                    // O nome do tipo vem do cliente: não é ecoado em erro nem em log.
+                    return Err(KavoError::UnsupportedType(format!("tipo {reason}")));
                 }
             }
         }
         let msg: Self = serde_json::from_slice(bytes).map_err(|e| {
-            KavoError::Protocol(format!("JSON inválido ou campo obrigatório ausente: {e}"))
+            KavoError::Protocol(format!(
+                "JSON inválido ou campo obrigatório ausente ({})",
+                describe_serde(&e)
+            ))
         })?;
         msg.validate()?;
         Ok(msg)
@@ -317,6 +315,11 @@ fn check_uuid(field: &str, value: &str) -> Result<()> {
         Ok(uuid) if uuid.get_version() == Some(Version::Random) => Ok(()),
         _ => Err(KavoError::Protocol(format!("{field} deve ser UUID v4"))),
     }
+}
+
+/// Descrição segura de erro do serde: categoria e coluna. Nunca inclui o valor recebido do cliente.
+pub(crate) fn describe_serde(e: &serde_json::Error) -> String {
+    format!("{:?} na coluna {}", e.classify(), e.column())
 }
 
 pub(crate) fn check_text(field: &str, value: &str, max: usize) -> Result<()> {

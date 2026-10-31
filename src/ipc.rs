@@ -146,13 +146,13 @@ async fn handle_connection(
                     match bus.publish(msg.clone()).await {
                         Ok(_) => respond(&msg),
                         Err(e) => {
-                            warn!(error = %e, "entrega garantida falhou");
+                            warn!(classe = e.kind().as_str(), "entrega garantida falhou");
                             Some(msg.error_reply(error_code::GENERIC_ERROR, error_text(&e)))
                         }
                     }
                 }
                 Err(e) => {
-                    warn!(error = %e, "mensagem rejeitada");
+                    warn!(classe = e.kind().as_str(), "mensagem rejeitada");
                     Some(KavoMessage::unparseable_error(
                         error_code::GENERIC_ERROR,
                         error_text(&e),
@@ -160,7 +160,10 @@ async fn handle_connection(
                 }
             },
             Err(e @ KavoError::FrameTooLarge { .. }) => {
-                warn!(error = %e, "conexão encerrada por mensagem grande demais");
+                warn!(
+                    classe = e.kind().as_str(),
+                    "conexão encerrada por mensagem grande demais"
+                );
                 let _ = write_message(
                     &mut write_half,
                     &KavoMessage::unparseable_error(error_code::GENERIC_ERROR, error_text(&e)),
@@ -179,14 +182,14 @@ async fn handle_connection(
                 break;
             }
             Err(e) => {
-                warn!(error = %e, "conexão encerrada");
+                warn!(classe = e.kind().as_str(), "conexão encerrada");
                 break;
             }
         };
 
         if let Some(reply) = reply {
             if let Err(e) = write_message(&mut write_half, &reply, settings.request_timeout).await {
-                warn!(error = %e, "falha ao responder");
+                warn!(classe = e.kind().as_str(), "falha ao responder");
                 break;
             }
         }

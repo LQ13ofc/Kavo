@@ -71,8 +71,12 @@ pub struct SpeechPayload {
 
 impl SpeechPayload {
     pub fn from_value(value: &serde_json::Value) -> Result<Self> {
-        let payload: Self = serde_json::from_value(value.clone())
-            .map_err(|e| KavoError::Protocol(format!("payload STT inválido: {e}")))?;
+        let payload: Self = serde_json::from_value(value.clone()).map_err(|e| {
+            KavoError::Protocol(format!(
+                "payload STT inválido ({})",
+                crate::protocol::describe_serde(&e)
+            ))
+        })?;
         payload.validate()?;
         Ok(payload)
     }
@@ -113,8 +117,12 @@ pub struct CancelPayload {
 
 impl CancelPayload {
     pub fn from_value(value: &serde_json::Value) -> Result<Self> {
-        serde_json::from_value(value.clone())
-            .map_err(|e| KavoError::Protocol(format!("payload CANCEL inválido: {e}")))
+        serde_json::from_value(value.clone()).map_err(|e| {
+            KavoError::Protocol(format!(
+                "payload CANCEL inválido ({})",
+                crate::protocol::describe_serde(&e)
+            ))
+        })
     }
 }
 
@@ -221,22 +229,41 @@ impl StreamTracker {
     }
 
     /// Aplica um evento. `now_ms` é o relógio monotônico do núcleo, usado para timeout.
+    /// Aplica um evento sem persistência externa (testes e cenários puramente em memória).
     pub fn apply(&mut self, session: &str, payload: &SpeechPayload, now_ms: u64) -> Acceptance {
+        self.apply_with(session, payload, now_ms, &mut |_| Ok(()))
+            .unwrap_or_else(|e| Acceptance::Rejected(e.to_string()))
+    }
+
+    /// Aplica um evento. Se o evento causar transição terminal (`StreamEnded`, `StreamFailed`),
+    /// chama `persist` ANTES de qualquer mudança em memória. Se `persist` falhar, devolve o erro
+    /// com a memória intacta e a sequência do evento não consumida (o produtor pode reenviar).
+    pub fn apply_with(
+        &mut self,
+        session: &str,
+        payload: &SpeechPayload,
+        now_ms: u64,
+        persist: &mut dyn FnMut(&TerminalTransition) -> Result<()>,
+    ) -> Result<Acceptance> {
         let content = canonical_of(payload);
         let key: StreamKey = (session.to_owned(), payload.stream_id);
 
         if !self.streams.contains_key(&key) {
             if self.retired.contains(&key) {
-                return Acceptance::Rejected("stream encerrado não pode ser reaberto".to_owned());
+                return Ok(Acceptance::Rejected(
+                    "stream encerrado não pode ser reaberto".to_owned(),
+                ));
             }
             if payload.sequence != 1 {
-                return Acceptance::Gap {
+                return Ok(Acceptance::Gap {
                     expected: 1,
                     got: payload.sequence,
-                };
+                });
             }
             if !self.make_room() {
-                return Acceptance::Rejected("limite de streams ativos atingido".to_owned());
+                return Ok(Acceptance::Rejected(
+                    "limite de streams ativos atingido".to_owned(),
+                ));
             }
             self.streams.insert(
                 key.clone(),
@@ -259,25 +286,43 @@ impl StreamTracker {
             .iter()
             .find(|(seq, _)| *seq == payload.sequence)
         {
-            return if *known == content {
+            return Ok(if *known == content {
                 Acceptance::Duplicate
             } else {
                 Acceptance::Rejected("sequência reutilizada com conteúdo diferente".to_owned())
-            };
+            });
         }
         if payload.sequence <= stream.last_sequence {
-            return Acceptance::Stale {
+            return Ok(Acceptance::Stale {
                 last_sequence: stream.last_sequence,
-            };
+            });
         }
         let expected = stream.last_sequence + 1;
         if payload.sequence > expected {
             // Atividade do produtor conta para o timeout, mesmo sem aplicar o evento.
             stream.last_activity_ms = now_ms;
-            return Acceptance::Gap {
+            return Ok(Acceptance::Gap {
                 expected,
                 got: payload.sequence,
-            };
+            });
+        }
+        if stream.status.is_terminal() {
+            // Já encerrado: evento novo é consumido e recusado, sem nova transição.
+            stream.last_sequence = payload.sequence;
+            stream.recent.push_back((payload.sequence, content));
+            if stream.recent.len() > DIGEST_WINDOW {
+                stream.recent.pop_front();
+            }
+            stream.last_activity_ms = now_ms;
+            return Ok(Acceptance::Rejected(format!(
+                "stream já encerrado ({:?})",
+                stream.status
+            )));
+        }
+
+        // Transição terminal: persistir antes de mudar qualquer coisa em memória.
+        if let Some(transition) = terminal_of(&payload.event) {
+            persist(&transition)?;
         }
 
         // Sequência esperada: consome o número, mesmo se o conteúdo for rejeitado.
@@ -287,14 +332,10 @@ impl StreamTracker {
             stream.recent.pop_front();
         }
         stream.last_activity_ms = now_ms;
-
-        if stream.status.is_terminal() {
-            return Acceptance::Rejected(format!("stream já encerrado ({:?})", stream.status));
-        }
-        match apply_event(stream, &payload.event) {
+        Ok(match apply_event(stream, &payload.event) {
             Ok(()) => Acceptance::Applied,
             Err(reason) => Acceptance::Rejected(reason),
-        }
+        })
     }
 
     /// Cancela um stream ativo. Se o stream ainda não existe, grava um aposento: ele não poderá começar.
@@ -314,18 +355,36 @@ impl StreamTracker {
         }
     }
 
-    /// Marca como expirados os streams ativos sem atividade há `idle_ms`. Retorna as chaves expiradas.
-    pub fn expire_idle(&mut self, now_ms: u64, idle_ms: u64) -> Vec<StreamKey> {
-        let mut expired = Vec::new();
-        for (key, stream) in &mut self.streams {
-            if !stream.status.is_terminal()
-                && now_ms.saturating_sub(stream.last_activity_ms) >= idle_ms
-            {
-                stream.status = StreamStatus::TimedOut;
-                expired.push(key.clone());
+    /// Streams ativos sem atividade há `idle_ms`. Não altera nada: quem chama grava antes e só então
+    /// chama `mark_timed_out`.
+    pub fn idle_candidates(&self, now_ms: u64, idle_ms: u64) -> Vec<StreamKey> {
+        self.streams
+            .iter()
+            .filter(|(_, s)| {
+                !s.status.is_terminal() && now_ms.saturating_sub(s.last_activity_ms) >= idle_ms
+            })
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// Marca um stream ativo como expirado. Chamar só depois da gravação `TIMED_OUT` ter sido confirmada.
+    pub fn mark_timed_out(&mut self, key: &StreamKey) -> bool {
+        match self.streams.get_mut(key) {
+            Some(s) if !s.status.is_terminal() => {
+                s.status = StreamStatus::TimedOut;
+                true
             }
+            _ => false,
         }
-        expired
+    }
+
+    /// Conveniência para testes: expira já, sem persistência.
+    pub fn expire_idle(&mut self, now_ms: u64, idle_ms: u64) -> Vec<StreamKey> {
+        let candidates = self.idle_candidates(now_ms, idle_ms);
+        candidates
+            .into_iter()
+            .filter(|k| self.mark_timed_out(k))
+            .collect()
     }
 
     pub fn status(&self, session: &str, stream_id: &Uuid) -> Option<&StreamStatus> {
@@ -388,6 +447,21 @@ impl StreamTracker {
             }
             None => false,
         }
+    }
+}
+
+/// Transição terminal que um evento causa. Deve ser gravada antes de valer em memória.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalTransition {
+    Ended,
+    Failed(String),
+}
+
+fn terminal_of(event: &SpeechEvent) -> Option<TerminalTransition> {
+    match event {
+        SpeechEvent::StreamEnded => Some(TerminalTransition::Ended),
+        SpeechEvent::StreamFailed { reason } => Some(TerminalTransition::Failed(reason.clone())),
+        _ => None,
     }
 }
 
