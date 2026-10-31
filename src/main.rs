@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use kavo::config::KavoConfig;
 use kavo::harness::{self, Options, SCENARIOS};
 use kavo::verification::Verification;
-use kavo::{ipc, logging, runtime};
+use kavo::{ipc, logging, menu, runtime};
 
 const USAGE: &str = "uso: kavo <run|ping|check-config> [--config CAMINHO]\n\
      uso: kavo harness <CENÁRIO...|all|list> [--dir DIR] [--socket SOCKET --store BANCO]";
@@ -23,7 +23,8 @@ struct Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut args = std::env::args().skip(1);
-    let command = args.next().ok_or_else(|| USAGE.to_owned())?;
+    // Sem argumentos: `command` vazio, que abre o menu em TTY ou mostra o uso.
+    let command = args.next().unwrap_or_default();
     let mut parsed = Args {
         command,
         ..Args::default()
@@ -69,6 +70,14 @@ async fn main() -> ExitCode {
 
     if let Err(e) = logging::init(&config.logging) {
         eprintln!("erro: {e}");
+        return ExitCode::from(2);
+    }
+
+    if args.command.is_empty() {
+        if let Some(code) = menu::open_if_tty(&config).await {
+            return code;
+        }
+        eprintln!("{USAGE}");
         return ExitCode::from(2);
     }
 
@@ -141,7 +150,7 @@ async fn run_harness(args: &Args, config: &KavoConfig) -> ExitCode {
         [one] if one == "all" => SCENARIOS
             .iter()
             .map(|(name, _)| (*name).to_owned())
-            .filter(|name| name != "ipc-stream")
+            .filter(|name| !name.starts_with("ipc-"))
             .collect(),
         many => many.to_vec(),
     };
@@ -186,6 +195,17 @@ async fn run_harness(args: &Args, config: &KavoConfig) -> ExitCode {
                             "ok": check.ok,
                             "detalhe": check.detail,
                         })
+                    );
+                }
+                if !report.metrics.is_empty() {
+                    let metrics: serde_json::Map<String, serde_json::Value> = report
+                        .metrics
+                        .iter()
+                        .map(|(name, value)| (name.clone(), serde_json::json!(value)))
+                        .collect();
+                    println!(
+                        "{}",
+                        serde_json::json!({"cenario": report.scenario, "metricas": metrics})
                     );
                 }
                 let passed = report.passed();

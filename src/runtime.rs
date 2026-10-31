@@ -150,10 +150,18 @@ pub async fn run(config: KavoConfig) -> Result<()> {
     let bus = EventBus::new(256, Duration::from_millis(config.ipc.request_timeout_ms));
     // Assinatura criada antes do IPC aceitar conexões: nenhuma mensagem inicial se perde.
     let monitor_rx = bus.subscribe();
+    let (control_tx, control_rx) = crate::control::channel_with(config.ipc.admission_queue);
     let mut supervisor = Supervisor::new(bus);
-    let monitor = ContractMonitor::open(monitor_rx, &config.speech, Default::default(), store)?;
+    let monitor = ContractMonitor::open_with_control(
+        monitor_rx,
+        &config.speech,
+        Default::default(),
+        store,
+        control_rx,
+    )?;
     supervisor.spawn(monitor);
-    let server = IpcServer::bind(&socket, IpcSettings::from_config(&config))?;
+    let server =
+        IpcServer::bind(&socket, IpcSettings::from_config(&config))?.with_control(control_tx);
     supervisor.spawn(server);
     info!(version = env!("CARGO_PKG_VERSION"), "Kavo em execução");
 

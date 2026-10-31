@@ -12,7 +12,7 @@ Legenda: **Aprovada** (pelo usuário) · **Provisória** (usada, aguarda revisã
 | D-06 | Configuração TOML + Serde, overrides `KAVO_*` | Aprovada | Crate `config` da doc não usada |
 | D-07 | Protocolo próprio chamado **Kavo Protocol** v1.1-draft; Hermes é referência | Aprovada (nome) / Provisória (versão) | Correção obrigatória do usuário |
 | D-08 | Tipos implementados: HEARTBEAT, ERROR, CANCEL | Provisória | Demais tipos da decisão 6.6 são **reservados** (rejeitados com erro explícito) |
-| D-09 | Tipos fora da 6.6 (VOICE_INPUT, STT_PARTIAL, CONNECTION_*, etc.) | Pendente | Só aparecem em 03/10; não implementados |
+| D-09 (local, histórico) | Tipos fora da 6.6 (VOICE_INPUT, STT_PARTIAL, CONNECTION_*, etc.) | Pendente | **Renumerada** em 31/10/2026: o D-09 vigente é o do Notion (linha abaixo). Este item continua pendente com o nome D-09-LOCAL |
 | D-18 | `STT_RESULT` e `INTENT_DETECTED` implementados em Kavo Protocol 1.1, com payload tipado | Provisória | Nomes vêm da decisão 6.6; parciais e finais no mesmo tipo, distinguidos por `state` |
 | D-19 | Parciais de STT são garantidos (não descartados) | Provisória | Perder evento quebra a sequência; custo de latência a medir |
 | D-20 | Contrato de STT agnóstico de fornecedor; nenhum mecanismo real | Provisória | Notion S1/A3 pede backend certificado; escolha pendente |
@@ -26,6 +26,34 @@ Legenda: **Aprovada** (pelo usuário) · **Provisória** (usada, aguarda revisã
 | D-28 | Lacuna de sequência não é aplicada e não há sinal de volta ao produtor | Provisória | Limitação conhecida; decidir se 1.1 precisa de `NACK` |
 | D-29 | Streams aposentados ficam para sempre no processo (sem limite) | Provisória | Substitui a lista de 256: sem reabertura por limite de memória. Não sobrevive a reinício |
 | D-31 | Registro durável de admissões e aposentados (SQLite, D-010) antes de qualquer execução | Implementada; **retenção pendente** | Ver `SPEECH-INTENT-CONTRACTS.md` §9. Não há Execution Engine ainda |
+| D-09 | Extensão do Kavo Protocol para sessões e cancelamento de requisições (Notion, 31/10/2026) | **Aprovada** | Implementada em 1.2 (`SESSION_CONTROL`, `CONTROL_RESULT`, `CANCEL` 1.2). Contrato em `KAVO-PROTOCOL.md` seção 10 |
+| D-53 | `KavoMessage::new` continua em `schema_version` 1.1 (padrão de compatibilidade); 1.2 é explícito | Provisória | Evita quebrar clientes e suítes 1.1; protocolo passa a `1.2-draft` |
+| D-54 | Monitor é a única autoridade de sessões, requisições e streams; IPC só encaminha e espera resposta | Provisória | Um dono de estado, sem Mutex compartilhado; sem duplicação entre Session Manager, monitor e daemon |
+| D-55 | Gate de sessão: 1.1 abre sessão desconhecida (legado); 1.2 recusa; encerrada recusa sempre | Provisória | Compatibilidade com clientes 1.1 sem reabrir sessão encerrada |
+| D-56 | Requisição = `REQUEST_BEGIN` com `kind: STT_STREAM`; cancelar requisição cancela seu stream vinculado; cancelar stream não altera a requisição | Provisória | Propagação real sem criar tarefas. `kind` restrito a STT_STREAM até decisão própria |
+| D-57 | `CONTROL_RESULT`: `outcome` APPLIED/NOOP/REJECTED; catálogo de `reason` | Provisória | Catálogo de motivos é proposta local; expandir exige revisão |
+| D-58 | Confirmação de admissão de eventos STT/INTENT 1.2 (`ADMISSION_ACK`: ACCEPTED, DUPLICATE, REJECTED, NOT_READY) | **Aprovada** (Notion, 31/10/2026) | Implementada na A1.1; contrato em `KAVO-PROTOCOL.md` seção 11. Não é ACK de conclusão |
+| D-59 | Falha de gravação no encerramento ou cancelamento: fail-closed, sessão segue ativa, operação repetível | Provisória | Streams já gravados como cancelados permanecem; nenhuma mudança em memória sem gravação |
+| D-60 | Menu `kavo` sem argumentos abre em TTY (requisito aprovado); só operações de leitura e harness | Provisória | Implementado como interface sobre a CLI; sem regra de negócio |
+| D-61 | Erros de controle usam `ERROR` 1100 com prefixo de classe, como D-32 | Provisória | Sem códigos 2xxx novos |
+| D-62 | Ponto de admissão: gate de sessão, validação do tracker e gravação durável exigida (abertura, terminal, upsert de interpretação) antes do ACK | Provisória | Define quando ACCEPTED é possível; parciais não gravam |
+| D-63 | Readiness e execução avaliadas depois do ACK; falha nelas não altera o status | Provisória | ACK não é conclusão nem execução (D-58) |
+| D-64 | `ipc.admission_queue` = 64 (1–4096), `KAVO_IPC_ADMISSION_QUEUE`; fila cheia = `NOT_READY BUSY` imediato | Provisória | Valor sem base de carga em hardware alvo; medido no E2E, a calibrar |
+| D-65 | Catálogo de `reason` ampliado (STREAM_CLOSED, SEQUENCE_GAP, STALE_REVISION, CONFLICT, INVALID_CONTENT, BUSY etc.) | Provisória | Motivos estáveis derivados das recusas do tracker; classificação por textos `REJECT_*` testada |
+| D-66 | Recusa por conteúdo consome a sequência; repetir devolve a mesma recusa, nunca DUPLICATE | Provisória | Corrige retry que mentiria sobre a admissão |
+| D-67 | Falha de gravação de interpretação desfaz a memória (`rollback`) antes do NOT_READY | Provisória | Sem isso, retry viraria DUPLICATE sem gravação durável |
+| D-68 | Sem ACK em prazo, IPC responde ERROR `[TIMEOUT]`, não ACK; cliente repete com a mesma identidade | Provisória | Estado incerto para o cliente, resolvido por idempotência |
+| D-69 | Cliente 1.2 envia um evento por vez e lê o ACK antes do próximo | Provisória | Preserva ordem do stream; o harness de teste segue essa regra |
+| D-70 | Replay idêntico de evento já aceito após evicção de stream devolve `DUPLICATE` (não mais "reaberto"); conteúdo diferente = `CONFLICT`. Testes da Fase 4.2 atualizados | Provisória | Consequência direta de D-58; não reabre nem reaplica. Mudança de expectativa de teste antigo, registrada |
+| D-71 | Abertura de stream gravada e não admitida em memória fica em `pending_open`; retry refaz só a decisão de memória, sem reabrir no banco | Provisória | Corrige recusa por capacidade com falha de gravação (ACK divergia do banco) |
+| D-72 | Motivo de "stream já gravado" vem do status durável: `REJECTED` → `STREAM_LIMIT`; demais → `STREAM_CLOSED` | Provisória | Retry devolve o mesmo motivo |
+| D-73 | Memória de streams guarda digest SHA-256 do conteúdo, não o texto canônico; janela de digests é preservada na evicção (`retired_recent`) | Provisória | Reduz memória e não retém texto transcrito fora do necessário; custo de memória por stream aposentado (D-29) |
+| D-74 | Interpretação sem registro em memória é rehidratada da durável antes de decidir | Provisória | Corrige `GAP` indevido após fim de stream |
+| D-75 | Idempotência do terminal de stream após reinício exige digest durável (mudança de esquema SQLite) | **Pendente** | Não decidido sem autorização; hoje devolve `STREAM_CLOSED` após reinício |
+| D-76 | Histórico de revisões de interpretação para repetir revisões antigas como `DUPLICATE` | **Pendente** | Hoje só a última revisão é reconhecida |
+| D-78 | Pendência de abertura (`pending_open`) é removida após gravação durável de cancelamento de stream e de encerramento de sessão; nunca antes da gravação | Provisória | Sem limpeza, entradas órfãs crescem e consomem o teto de todas as sessões; `pending-lifecycle` cobre limpeza, falha na limpeza e repetição |
+| D-79 | Teto de aberturas pendentes = `speech.max_streams`; acima dele, nova abertura recebe `NOT_READY BUSY` sem gravação | Provisória | Limita crescimento por clientes que abandonam streams; valor herdado da configuração existente, sem medição própria |
+| D-77 | Envio ao monitor (controle e admissão) sempre com prazo do IPC; fila cheia nunca bloqueia indefinidamente | Provisória | Elimina bloqueio indefinido observado na auditoria |
 | D-36 | Política de retenção de admissões: nenhuma (imutáveis) | Pendente | Precisa de aprovação antes de crescer sem limite |
 | D-37 | Stream interrompido no reinício nunca é retomado | Provisória | Produtor reinicia com `stream_id` novo |
 | D-38 | Banco com erro ou esquema desconhecido impede o início | Provisória | Fail-closed |
@@ -53,9 +81,9 @@ Legenda: **Aprovada** (pelo usuário) · **Provisória** (usada, aguarda revisã
 | D-47 | Producer envia eventos de um mesmo stream em uma conexão, em ordem | Provisória | Conexões separadas podem ser processadas fora de ordem (achado no E2E real); sem NACK (D-35) |
 | D-48 | Falha de gravação é injetada por trigger SQLite (`RAISE(ABORT)`) no cenário `store-fault`, sem alterar código de produção | Provisória | Teste reversível, real no SQLite; reenvio idêntico recupera o estado |
 | D-49 | Cenários do harness só embutidos e escolhidos por argumento; cenários por arquivo não implementados | Provisória | Nenhum requisito aprovado pede arquivos de cenário; adiar até haver necessidade |
-| D-50 | Integração do Session Manager ao daemon (sessões no IPC) fica fora de A0 | Pendente | Exige tipos de mensagem de sessão, dependente de D-09; protocolo não alterado |
+| D-50 | Integração do Session Manager ao daemon (sessões no IPC). **Implementada em A1 sob D-09** | Provisória | Exige tipos de mensagem de sessão, dependente de D-09; protocolo não alterado |
 | D-51 | Logs e artefatos E2E ficam em `target/e2e` (ignorado pelo Git), com XDG próprio | Provisória | Não toca dados do usuário; socket limitado a 108 bytes (`SUN_LEN`) |
-| D-52 | Cancelamento de requisição (`correlation_id`) sem alvo no núcleo | Pendente | Não há registro de requisições no daemon; só stream é cancelado pelo socket |
+| D-52 | Cancelamento de requisição (`correlation_id`) sem alvo no núcleo. **Resolvida por D-09 e D-56** | Resolvida | Não há registro de requisições no daemon; só stream é cancelado pelo socket |
 
 ## Reconciliação 03-PROTOCOLOS × 10-CONTRATOS
 Detalhada em `KAVO-PROTOCOL.md`, seção 7.

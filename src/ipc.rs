@@ -10,13 +10,14 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc::error::TrySendError, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::bus::EventBus;
 use crate::config::KavoConfig;
+use crate::control::{AdmissionAck, AdmissionStatus, ControlCommand, ControlSender, Reason};
 use crate::error::{KavoError, Result};
 use crate::protocol::{KavoMessage, MessageType, error_code};
 use crate::runtime::{Component, ComponentContext};
@@ -115,10 +116,109 @@ fn error_text(e: &KavoError) -> String {
     format!("[{}] {e}", e.kind().as_str())
 }
 
+/// Pedido que precisa de resposta do monitor: sessão, requisição e cancelamento 1.2.
+fn is_control(msg: &KavoMessage) -> bool {
+    msg.kind == MessageType::SessionControl || (msg.kind == MessageType::Cancel && msg.minor() >= 2)
+}
+
+/// Evento STT ou INTENT 1.2: recebe `ADMISSION_ACK`. O 1.1 segue sem resposta.
+fn is_admission(msg: &KavoMessage) -> bool {
+    matches!(
+        msg.kind,
+        MessageType::SttResult | MessageType::IntentDetected
+    ) && msg.minor() >= 2
+}
+
+/// Admissão sem bloqueio no IPC: fila cheia vira `NOT_READY BUSY` imediato (backpressure).
+/// Prazo sem resposta vira `ERROR`: o cliente repete com a mesma identidade, e o monitor responde
+/// `DUPLICATE` se o evento já tiver sido admitido.
+async fn route_admission(
+    control: Option<&ControlSender>,
+    msg: &KavoMessage,
+    timeout: Duration,
+) -> KavoMessage {
+    let Some(sender) = control else {
+        return msg.error_reply(
+            error_code::GENERIC_ERROR,
+            "[INTERNAL] admissão indisponível neste núcleo",
+        );
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    match sender.try_send(ControlCommand {
+        msg: msg.clone(),
+        reply: reply_tx,
+    }) {
+        Ok(()) => match tokio::time::timeout(timeout, reply_rx).await {
+            Ok(Ok(reply)) => reply,
+            _ => msg.error_reply(error_code::GENERIC_ERROR, "[TIMEOUT] sem ACK do monitor"),
+        },
+        Err(TrySendError::Full(_)) => {
+            let ack = AdmissionAck::for_event(msg, AdmissionStatus::NotReady, Some(Reason::Busy));
+            ack.reply_to(msg).unwrap_or_else(|e| {
+                msg.error_reply(
+                    error_code::GENERIC_ERROR,
+                    format!("[{}] {e}", e.kind().as_str()),
+                )
+            })
+        }
+        Err(TrySendError::Closed(_)) => {
+            msg.error_reply(error_code::GENERIC_ERROR, "[INTERNAL] monitor indisponível")
+        }
+    }
+}
+
+/// Entrega um pedido de controle ao monitor e espera a resposta, com prazo do IPC.
+async fn route_control(
+    control: Option<&ControlSender>,
+    msg: &KavoMessage,
+    timeout: Duration,
+) -> KavoMessage {
+    let Some(sender) = control else {
+        return msg.error_reply(
+            error_code::GENERIC_ERROR,
+            "[INTERNAL] controle indisponível neste núcleo",
+        );
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    // Com fila cheia de admissões, o envio espera no máximo o prazo do IPC: nunca bloqueia indefinidamente.
+    match tokio::time::timeout(
+        timeout,
+        sender.send(ControlCommand {
+            msg: msg.clone(),
+            reply: reply_tx,
+        }),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            return msg.error_reply(error_code::GENERIC_ERROR, "[INTERNAL] monitor indisponível");
+        }
+        Err(_) => {
+            return msg.error_reply(
+                error_code::GENERIC_ERROR,
+                "[TIMEOUT] fila de controle cheia",
+            );
+        }
+    }
+    match tokio::time::timeout(timeout, reply_rx).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(_)) => msg.error_reply(
+            error_code::GENERIC_ERROR,
+            "[INTERNAL] pedido de controle descartado",
+        ),
+        Err(_) => msg.error_reply(
+            error_code::GENERIC_ERROR,
+            "[TIMEOUT] sem resposta do monitor",
+        ),
+    }
+}
+
 async fn handle_connection(
     stream: UnixStream,
     settings: IpcSettings,
     bus: EventBus,
+    control: Option<ControlSender>,
     cancel: CancellationToken,
 ) {
     let (read_half, mut write_half) = stream.into_split();
@@ -141,6 +241,26 @@ async fn handle_connection(
         let reply = match frame {
             Ok(None) => break,
             Ok(Some(bytes)) => match KavoMessage::from_json_slice(&bytes) {
+                // Respostas do núcleo não são aceitas como entrada.
+                Ok(msg)
+                    if matches!(
+                        msg.kind,
+                        MessageType::ControlResult | MessageType::AdmissionAck
+                    ) =>
+                {
+                    Some(msg.error_reply(
+                        error_code::GENERIC_ERROR,
+                        "[INVALID_MESSAGE] tipo de resposta é reservado ao núcleo",
+                    ))
+                }
+                Ok(msg) if is_admission(&msg) => {
+                    debug!(kind = ?msg.kind, session_id = %msg.session_id, "evento com admissão");
+                    Some(route_admission(control.as_ref(), &msg, settings.request_timeout).await)
+                }
+                Ok(msg) if is_control(&msg) => {
+                    debug!(kind = ?msg.kind, session_id = %msg.session_id, "pedido de controle");
+                    Some(route_control(control.as_ref(), &msg, settings.request_timeout).await)
+                }
                 Ok(msg) => {
                     debug!(kind = ?msg.kind, session_id = %msg.session_id, "mensagem recebida");
                     match bus.publish(msg.clone()).await {
@@ -202,6 +322,8 @@ pub struct IpcServer {
     listener: UnixListener,
     path: PathBuf,
     settings: IpcSettings,
+    /// Canal para pedidos de controle com resposta (1.2). Sem ele, esses pedidos recebem ERROR.
+    control: Option<ControlSender>,
 }
 
 impl IpcServer {
@@ -250,7 +372,14 @@ impl IpcServer {
             listener,
             path: path.to_path_buf(),
             settings,
+            control: None,
         })
+    }
+
+    /// Liga o servidor ao monitor, que aplica os pedidos de controle.
+    pub fn with_control(mut self, control: ControlSender) -> Self {
+        self.control = Some(control);
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -260,6 +389,7 @@ impl IpcServer {
     /// Aceita conexões até o cancelamento. Conexões em andamento recebem o mesmo sinal.
     pub async fn serve(self, bus: EventBus, cancel: CancellationToken) -> Result<()> {
         info!(socket = %self.path.display(), "servidor IPC ativo");
+        let control = self.control.clone();
         let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let mut connections = JoinSet::new();
 
@@ -282,10 +412,11 @@ impl IpcServer {
                     };
                     let settings = self.settings;
                     let bus = bus.clone();
+                    let control = control.clone();
                     let child = cancel.child_token();
                     connections.spawn(async move {
                         let _permit = permit;
-                        handle_connection(stream, settings, bus, child).await;
+                        handle_connection(stream, settings, bus, control, child).await;
                     });
                 }
                 Some(joined) = connections.join_next(), if !connections.is_empty() => {

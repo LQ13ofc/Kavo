@@ -2,12 +2,14 @@
 
 pub mod bus;
 pub mod config;
+pub mod control;
 pub mod error;
 pub mod harness;
 pub mod instance;
 pub mod intent;
 pub mod ipc;
 pub mod logging;
+pub mod menu;
 pub mod monitor;
 pub mod protocol;
 pub mod runtime;

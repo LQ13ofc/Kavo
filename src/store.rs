@@ -507,6 +507,15 @@ impl Store {
         Ok(outcome)
     }
 
+    /// Linha durável de uma interpretação, se existir. Autoridade para idempotência após esquecer a memória.
+    pub fn interpretation(
+        &self,
+        session: &str,
+        interpretation: &Uuid,
+    ) -> Result<Option<InterpretationRow>> {
+        read_interp(&self.conn, session, interpretation).map_err(|e| db_err("ler interpretação", e))
+    }
+
     /// Grava ou atualiza uma interpretação (sem admissão).
     /// Grava uma revisão de interpretação somente se ela avança a durável. Atômico.
     pub fn upsert_interpretation(

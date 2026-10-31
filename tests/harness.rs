@@ -29,7 +29,7 @@ fn options(dir: &std::path::Path) -> Options {
 async fn in_process_scenarios_pass() {
     let dir = tempfile::tempdir().expect("diretório temporário");
     let opts = options(dir.path());
-    for (name, _) in SCENARIOS.iter().filter(|(n, _)| *n != "ipc-stream") {
+    for (name, _) in SCENARIOS.iter().filter(|(n, _)| !n.starts_with("ipc-")) {
         let report = harness::run(name, &opts).await.expect("cenário executa");
         let failed: Vec<_> = report.checks.iter().filter(|c| !c.ok).collect();
         assert!(report.passed(), "cenário {name} reprovado: {failed:?}");

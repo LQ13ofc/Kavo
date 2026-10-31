@@ -77,6 +77,8 @@ pub struct IpcConfig {
     pub request_timeout_ms: u64,
     /// Tempo máximo sem nenhuma mensagem antes de fechar a conexão.
     pub idle_timeout_ms: u64,
+    /// Eventos STT/INTENT 1.2 aguardando admissão no monitor. Cheia = `NOT_READY BUSY` imediato.
+    pub admission_queue: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -103,6 +105,7 @@ impl Default for IpcConfig {
             max_frame_bytes: 64 * 1024,
             request_timeout_ms: 2_000,
             idle_timeout_ms: 30_000,
+            admission_queue: 64,
         }
     }
 }
@@ -148,6 +151,10 @@ impl KavoConfig {
         if let Some(v) = env("KAVO_IPC_SOCKET_PATH") {
             self.ipc.socket_path = Some(PathBuf::from(v));
         }
+        if let Some(v) = env("KAVO_IPC_ADMISSION_QUEUE") {
+            self.ipc.admission_queue = usize::try_from(parse_u64("KAVO_IPC_ADMISSION_QUEUE", &v)?)
+                .map_err(|_| invalid("KAVO_IPC_ADMISSION_QUEUE", "valor fora do intervalo"))?;
+        }
         if let Some(v) = env("KAVO_STORE_PATH") {
             self.store.path = Some(PathBuf::from(v));
         }
@@ -185,6 +192,9 @@ impl KavoConfig {
             if !c.is_finite() || !(0.0..=1.0).contains(&c) {
                 return Err(invalid("speech.min_confidence", "deve estar em [0.0, 1.0]"));
             }
+        }
+        if !(1..=4096).contains(&self.ipc.admission_queue) {
+            return Err(invalid("ipc.admission_queue", "deve estar entre 1 e 4096"));
         }
         if self.ipc.idle_timeout_ms == 0 {
             return Err(invalid("ipc.idle_timeout_ms", "deve ser maior que zero"));

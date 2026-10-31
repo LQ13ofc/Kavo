@@ -225,7 +225,7 @@ fn check_list(field: &str, len: usize, max: usize) -> Result<()> {
 }
 
 #[derive(Debug, Clone)]
-struct InterpretationRecord {
+pub struct InterpretationRecord {
     stream_id: Uuid,
     segment_id: Uuid,
     revision: u32,
@@ -243,6 +243,11 @@ pub type InterpretationKey = (String, Uuid);
 pub struct InterpretationTracker {
     records: HashMap<InterpretationKey, InterpretationRecord>,
 }
+
+/// Textos estáveis de recusa de interpretação, classificados no ACK de admissão.
+pub const REJECT_STREAM_CLOSED: &str = "interpretação cancelada";
+pub const REJECT_STALE: &str = "source_revision regrediu";
+pub const REJECT_CONFLICT: &str = "revisão reutilizada com conteúdo diferente";
 
 impl InterpretationTracker {
     /// Carrega registros duráveis após reinício.
@@ -299,7 +304,7 @@ impl InterpretationTracker {
             return if last.content_digest == digest {
                 Acceptance::Duplicate
             } else {
-                Acceptance::Rejected("revisão reutilizada com conteúdo diferente".to_owned())
+                Acceptance::Rejected(REJECT_CONFLICT.to_owned())
             };
         }
         if payload.revision < last.revision {
@@ -317,13 +322,38 @@ impl InterpretationTracker {
             };
         }
         if last.cancelled {
-            return Acceptance::Rejected("interpretação cancelada não aceita revisões".to_owned());
+            return Acceptance::Rejected(format!("{REJECT_STREAM_CLOSED} não aceita revisões"));
         }
         if payload.source_revision < last.source_revision {
-            return Acceptance::Rejected("source_revision regrediu".to_owned());
+            return Acceptance::Rejected(REJECT_STALE.to_owned());
         }
         self.records.insert(key, record(payload, digest));
         Acceptance::Applied
+    }
+
+    /// Registro atual de uma interpretação, para desfazer a memória se a gravação falhar.
+    pub fn snapshot(&self, session: &str, interpretation: &Uuid) -> Option<InterpretationRecord> {
+        self.records
+            .get(&(session.to_owned(), *interpretation))
+            .cloned()
+    }
+
+    /// Desfaz `apply` quando a gravação durável não ocorreu: a memória volta ao estado anterior.
+    pub fn rollback(
+        &mut self,
+        session: &str,
+        interpretation: &Uuid,
+        previous: Option<InterpretationRecord>,
+    ) {
+        let key = (session.to_owned(), *interpretation);
+        match previous {
+            Some(record) => {
+                self.records.insert(key, record);
+            }
+            None => {
+                self.records.remove(&key);
+            }
+        }
     }
 
     /// Marca como canceladas as interpretações de um stream. Retorna quantas mudaram.

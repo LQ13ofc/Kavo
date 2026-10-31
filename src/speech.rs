@@ -6,6 +6,7 @@
 //!   Lacuna (`Gap`) não é aplicada; o produtor deve reenviar a partir de `expected`.
 //! - Texto nunca é comando. Esta camada só valida e rastreia; não executa nada.
 
+use crate::store::sha256_hex;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,11 @@ use crate::protocol::check_text;
 
 pub const MAX_TEXT_CHARS: usize = 2_048;
 pub const MAX_REASON_CHARS: usize = 128;
+/// Textos estáveis de recusa, usados também para classificar o motivo no ACK de admissão.
+pub const REJECT_STREAM_CLOSED: &str = "stream encerrado";
+pub const REJECT_STREAM_LIMIT: &str = "limite de streams ativos atingido";
+pub const REJECT_CONFLICT: &str = "sequência reutilizada com conteúdo diferente";
+
 /// Quantidade de sequências recentes guardadas para detectar duplicatas.
 const DIGEST_WINDOW: usize = 64;
 /// Segmentos por stream. Acima disso, a transcrição nova é rejeitada.
@@ -199,7 +205,9 @@ struct StreamState {
     status: StreamStatus,
     last_sequence: u64,
     /// (sequência, conteúdo canônico) das últimas `DIGEST_WINDOW` sequências.
-    recent: VecDeque<(u64, String)>,
+    /// Texto da recusa, quando a sequência foi consumida e rejeitada. Repetir a mesma sequência
+    /// devolve a mesma recusa, nunca `Duplicate`.
+    recent: VecDeque<(u64, String, Option<String>)>,
     segments: HashMap<Uuid, SegmentState>,
     last_activity_ms: u64,
 }
@@ -216,6 +224,9 @@ pub type StreamKey = (String, Uuid);
 pub struct StreamTracker {
     streams: HashMap<StreamKey, StreamState>,
     retired: HashSet<StreamKey>,
+    /// Janela de digests de streams removidos da memória por capacidade. Repetições do que já foi
+    /// consumido continuam sendo reconhecidas (`DUPLICATE`/recusa original), não tratadas como novas.
+    retired_recent: HashMap<StreamKey, VecDeque<(u64, String, Option<String>)>>,
     max_streams: usize,
 }
 
@@ -224,6 +235,7 @@ impl StreamTracker {
         Self {
             streams: HashMap::new(),
             retired: HashSet::new(),
+            retired_recent: HashMap::new(),
             max_streams: max_streams.max(1),
         }
     }
@@ -245,14 +257,28 @@ impl StreamTracker {
         now_ms: u64,
         persist: &mut dyn FnMut(&TerminalTransition) -> Result<()>,
     ) -> Result<Acceptance> {
-        let content = canonical_of(payload);
+        // Digest do conteúdo: comparação exata sem guardar o texto transcrito na memória.
+        let content = sha256_hex(&canonical_of(payload));
         let key: StreamKey = (session.to_owned(), payload.stream_id);
 
         if !self.streams.contains_key(&key) {
             if self.retired.contains(&key) {
-                return Ok(Acceptance::Rejected(
-                    "stream encerrado não pode ser reaberto".to_owned(),
-                ));
+                if let Some(recent) = self.retired_recent.get(&key) {
+                    if let Some((_, known, reject)) =
+                        recent.iter().find(|(seq, _, _)| *seq == payload.sequence)
+                    {
+                        return Ok(if *known != content {
+                            Acceptance::Rejected(REJECT_CONFLICT.to_owned())
+                        } else if let Some(reason) = reject {
+                            Acceptance::Rejected(reason.clone())
+                        } else {
+                            Acceptance::Duplicate
+                        });
+                    }
+                }
+                return Ok(Acceptance::Rejected(format!(
+                    "{REJECT_STREAM_CLOSED} não pode ser reaberto"
+                )));
             }
             if payload.sequence != 1 {
                 return Ok(Acceptance::Gap {
@@ -261,9 +287,7 @@ impl StreamTracker {
                 });
             }
             if !self.make_room() {
-                return Ok(Acceptance::Rejected(
-                    "limite de streams ativos atingido".to_owned(),
-                ));
+                return Ok(Acceptance::Rejected(REJECT_STREAM_LIMIT.to_owned()));
             }
             self.streams.insert(
                 key.clone(),
@@ -281,15 +305,17 @@ impl StreamTracker {
             .get_mut(&key)
             .expect("stream presente ou inserido acima");
 
-        if let Some((_, known)) = stream
+        if let Some(known) = stream
             .recent
             .iter()
-            .find(|(seq, _)| *seq == payload.sequence)
+            .find(|(seq, _, _)| *seq == payload.sequence)
         {
-            return Ok(if *known == content {
-                Acceptance::Duplicate
+            return Ok(if known.1 != content {
+                Acceptance::Rejected(REJECT_CONFLICT.to_owned())
+            } else if let Some(reason) = &known.2 {
+                Acceptance::Rejected(reason.clone())
             } else {
-                Acceptance::Rejected("sequência reutilizada com conteúdo diferente".to_owned())
+                Acceptance::Duplicate
             });
         }
         if payload.sequence <= stream.last_sequence {
@@ -308,16 +334,16 @@ impl StreamTracker {
         }
         if stream.status.is_terminal() {
             // Já encerrado: evento novo é consumido e recusado, sem nova transição.
+            let reason = format!("{REJECT_STREAM_CLOSED} ({:?})", stream.status);
             stream.last_sequence = payload.sequence;
-            stream.recent.push_back((payload.sequence, content));
+            stream
+                .recent
+                .push_back((payload.sequence, content, Some(reason.clone())));
             if stream.recent.len() > DIGEST_WINDOW {
                 stream.recent.pop_front();
             }
             stream.last_activity_ms = now_ms;
-            return Ok(Acceptance::Rejected(format!(
-                "stream já encerrado ({:?})",
-                stream.status
-            )));
+            return Ok(Acceptance::Rejected(reason));
         }
 
         // Transição terminal: persistir antes de mudar qualquer coisa em memória.
@@ -327,14 +353,17 @@ impl StreamTracker {
 
         // Sequência esperada: consome o número, mesmo se o conteúdo for rejeitado.
         stream.last_sequence = payload.sequence;
-        stream.recent.push_back((payload.sequence, content));
+        stream.last_activity_ms = now_ms;
+        let outcome = apply_event(stream, &payload.event).err();
+        stream
+            .recent
+            .push_back((payload.sequence, content, outcome.clone()));
         if stream.recent.len() > DIGEST_WINDOW {
             stream.recent.pop_front();
         }
-        stream.last_activity_ms = now_ms;
-        Ok(match apply_event(stream, &payload.event) {
-            Ok(()) => Acceptance::Applied,
-            Err(reason) => Acceptance::Rejected(reason),
+        Ok(match outcome {
+            None => Acceptance::Applied,
+            Some(reason) => Acceptance::Rejected(reason),
         })
     }
 
@@ -384,6 +413,15 @@ impl StreamTracker {
         candidates
             .into_iter()
             .filter(|k| self.mark_timed_out(k))
+            .collect()
+    }
+
+    /// Streams ainda ativos de uma sessão. Usado no encerramento de sessão.
+    pub fn active_streams(&self, session: &str) -> Vec<Uuid> {
+        self.streams
+            .iter()
+            .filter(|(key, state)| key.0 == session && state.status == StreamStatus::Active)
+            .map(|(key, _)| key.1)
             .collect()
     }
 
@@ -441,7 +479,9 @@ impl StreamTracker {
             .map(|(key, _)| key.clone());
         match victim {
             Some(key) => {
-                self.streams.remove(&key);
+                if let Some(state) = self.streams.remove(&key) {
+                    self.retired_recent.insert(key.clone(), state.recent);
+                }
                 self.retired.insert(key);
                 true
             }

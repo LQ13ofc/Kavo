@@ -35,6 +35,7 @@ Escopo: sem voz, wake word, STT, TTS, LLM, automação ou UI.
 
 ```bash
 cargo build --release
+target/release/kavo                # menu de desenvolvimento (somente em TTY)
 target/release/kavo check-config   # configuração efetiva
 target/release/kavo run            # núcleo; SIGINT/SIGTERM encerram
 target/release/kavo ping           # JSON com SUCCESS / FAILED / UNKNOWN
@@ -50,7 +51,7 @@ Socket: `$XDG_RUNTIME_DIR/kavo/kavo.sock` (0600; diretório 0700).
 ## Testes
 
 ```bash
-cargo test                          # 156 testes (unitários e integração)
+cargo test                          # 180 testes (unitários e integração)
 cargo clippy --all-targets --all-features -- -D warnings   # 0 avisos
 ```
 
@@ -70,13 +71,23 @@ target/release/kavo harness ipc-stream --socket "$KAVO_IPC_SOCKET_PATH" --store 
 Saída: uma linha JSON por verificação e uma por cenário. Código 0 = tudo aprovado; 1 = reprovação ou erro; 2 = uso inválido.
 `ipc-stream` exige núcleo em execução e banco do mesmo núcleo; não entra em `all`.
 
-Session Manager (`src/session.rs`): ciclo de vida de sessões e cancelamento por requisição, só em memória. Não concede permissões.
+Sessões e requisições (Kavo Protocol 1.2, D-09): `docs/KAVO-PROTOCOL.md` seção 10. O monitor é a autoridade de estado;
+`SESSION_CONTROL` e `CANCEL` 1.2 recebem `CONTROL_RESULT`. Estado de sessão só em memória. Não concede permissões.
+
+ACK de admissão (D-58, `docs/KAVO-PROTOCOL.md` seção 11): cada `STT_RESULT` e `INTENT_DETECTED` 1.2 recebe `ADMISSION_ACK`
+(`ACCEPTED`, `DUPLICATE`, `REJECTED`, `NOT_READY`). Fila de admissão: `ipc.admission_queue` / `KAVO_IPC_ADMISSION_QUEUE` (padrão 64).
+
+Cenários de admissão: `admission`, `admission-load`, `admission-faults`, `pending-lifecycle` (em processo); `ipc-admission`, `ipc-backpressure`, `ipc-bench` (núcleo real).
+`ipc-backpressure` exige o daemon com `KAVO_IPC_ADMISSION_QUEUE=1` para exercitar `BUSY`.
+
+Cenários de controle: `control-lifecycle`, `control-requests`, `control-events`, `control-shutdown`, `control-store-fault`, `compat`
+(em processo) e `ipc-control`, `ipc-interrupt-prepare` / `ipc-interrupt-verify` (núcleo real; o último exige reinício entre as duas chamadas).
 
 ## Limitações
 
 - Sem mecanismo real de STT nem de NLU/JEV; só contratos e regras.
 - Sem Capability Registry, Policy Engine, Planner, Task Manager ou Execution Engine.
-- Protocolo: HEARTBEAT, ERROR, CANCEL, STT_RESULT, INTENT_DETECTED.
+- Protocolo 1.2: HEARTBEAT, ERROR, CANCEL, STT_RESULT, INTENT_DETECTED, SESSION_CONTROL, CONTROL_RESULT.
 - Barramento só em processo; sem Message Bus externo.
 - Código 1100 para quase todos os erros até a taxonomia ser aprovada.
 - Apenas Linux (Unix socket, flock).

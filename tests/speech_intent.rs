@@ -1145,11 +1145,22 @@ fn cancelled_or_evicted_stream_cannot_be_reopened_with_sequence_one() {
         t.apply(S, &speech(b, 1, SpeechEvent::NoSpeech), 1),
         Acceptance::Applied
     );
+    // Replay idêntico de evento já aceito: DUPLICATE (D-58). Nunca reabre nem reaplica.
     let out = t.apply(S, &speech(a, 1, SpeechEvent::NoSpeech), 2);
-    assert!(
-        matches!(out, Acceptance::Rejected(ref m) if m.contains("reaberto")),
-        "{out:?}"
+    assert_eq!(out, Acceptance::Duplicate, "{out:?}");
+    // Conteúdo diferente com a mesma sequência nunca reabre o stream.
+    let changed = t.apply(
+        S,
+        &speech(
+            a,
+            1,
+            SpeechEvent::SpeechEnded {
+                segment_id: Uuid::new_v4(),
+            },
+        ),
+        3,
     );
+    assert!(matches!(changed, Acceptance::Rejected(_)), "{changed:?}");
 }
 
 #[test]
@@ -1336,11 +1347,22 @@ fn stream_cannot_be_reopened_after_many_evictions() {
         );
         t.cancel(S, &other);
     }
+    // Replay idêntico do aceito original: DUPLICATE, mesmo após muitas evicções (janela preservada).
     let out = t.apply(S, &speech(first, 1, SpeechEvent::NoSpeech), 1);
-    assert!(
-        matches!(out, Acceptance::Rejected(ref m) if m.contains("reaberto")),
-        "{out:?}"
+    assert_eq!(out, Acceptance::Duplicate, "{out:?}");
+    // Conteúdo diferente: rejeitado, e o stream continua não reaberto.
+    let changed = t.apply(
+        S,
+        &speech(
+            first,
+            1,
+            SpeechEvent::SpeechEnded {
+                segment_id: Uuid::new_v4(),
+            },
+        ),
+        2,
     );
+    assert!(matches!(changed, Acceptance::Rejected(_)), "{changed:?}");
 }
 
 #[test]

@@ -11,6 +11,8 @@ use crate::intent::InterpretationPayload;
 use crate::speech::{CancelPayload, SpeechPayload};
 
 pub const PROTOCOL_NAME: &str = "Kavo Protocol";
+/// `schema_version` padrão das mensagens criadas por `KavoMessage::new`. Mantido em 1.1 para que clientes
+/// 1.1 continuem com o comportamento legado. Tipos 1.2 definem `schema_version` explicitamente.
 pub const SCHEMA_VERSION: &str = "1.1";
 pub const SENDER_CORE: &str = "kavo-core";
 pub const UNKNOWN_SESSION: &str = "unknown";
@@ -25,6 +27,9 @@ pub const IMPLEMENTED_TYPES: &[&str] = &[
     "CANCEL",
     "STT_RESULT",
     "INTENT_DETECTED",
+    "SESSION_CONTROL",
+    "CONTROL_RESULT",
+    "ADMISSION_ACK",
 ];
 
 /// Tipos reservados pela decisão 6.6, ainda não implementados. Recebê-los gera erro explícito.
@@ -74,6 +79,9 @@ pub enum MessageType {
     Cancel,
     SttResult,
     IntentDetected,
+    SessionControl,
+    ControlResult,
+    AdmissionAck,
 }
 
 /// Classe de entrega no barramento interno (ver `KAVO-PROTOCOL.md`, seção 6).
@@ -89,9 +97,13 @@ impl MessageType {
     pub fn delivery(self) -> Delivery {
         match self {
             Self::Heartbeat => Delivery::BestEffort,
-            Self::Error | Self::Cancel | Self::SttResult | Self::IntentDetected => {
-                Delivery::Guaranteed
-            }
+            Self::Error
+            | Self::Cancel
+            | Self::SttResult
+            | Self::IntentDetected
+            | Self::SessionControl
+            | Self::ControlResult
+            | Self::AdmissionAck => Delivery::Guaranteed,
         }
     }
 
@@ -100,9 +112,25 @@ impl MessageType {
         matches!(self, Self::SttResult | Self::IntentDetected)
     }
 
+    /// Tipos introduzidos na 1.2 (controle de sessões e requisições).
+    pub fn requires_minor_1_2(self) -> bool {
+        matches!(
+            self,
+            Self::SessionControl | Self::ControlResult | Self::AdmissionAck
+        )
+    }
+
     /// Tipos que carregam `payload`.
     pub fn takes_payload(self) -> bool {
-        matches!(self, Self::Cancel | Self::SttResult | Self::IntentDetected)
+        matches!(
+            self,
+            Self::Cancel
+                | Self::SttResult
+                | Self::IntentDetected
+                | Self::SessionControl
+                | Self::ControlResult
+                | Self::AdmissionAck
+        )
     }
 }
 
@@ -218,6 +246,13 @@ impl KavoMessage {
             )));
         }
 
+        if self.kind.requires_minor_1_2() && self.minor() < 2 {
+            return Err(KavoError::UnsupportedVersion(format!(
+                "{:?} exige schema_version 1.2",
+                self.kind
+            )));
+        }
+
         match self.kind {
             MessageType::Error if self.error_code.is_none() => {
                 return Err(KavoError::Protocol("ERROR sem error_code".to_owned()));
@@ -231,6 +266,9 @@ impl KavoMessage {
             | MessageType::Cancel
             | MessageType::SttResult
             | MessageType::IntentDetected
+            | MessageType::SessionControl
+            | MessageType::ControlResult
+            | MessageType::AdmissionAck
                 if self.error_code.is_some() =>
             {
                 return Err(KavoError::Protocol(
@@ -260,6 +298,21 @@ impl KavoMessage {
                 InterpretationPayload::from_value(p).map(|_| ())
             }
             (MessageType::SttResult | MessageType::IntentDetected, None) => Err(
+                KavoError::Protocol(format!("{:?} exige payload", self.kind)),
+            ),
+            (MessageType::SessionControl, Some(p)) => {
+                crate::control::SessionControl::from_value(p).map(|_| ())
+            }
+            (MessageType::AdmissionAck, Some(p)) => {
+                crate::control::AdmissionAck::from_value(p).map(|_| ())
+            }
+            (MessageType::AdmissionAck, None) => Err(KavoError::Protocol(
+                "ADMISSION_ACK exige payload".to_owned(),
+            )),
+            (MessageType::ControlResult, Some(p)) => {
+                crate::control::ControlResult::from_value(p).map(|_| ())
+            }
+            (MessageType::SessionControl | MessageType::ControlResult, None) => Err(
                 KavoError::Protocol(format!("{:?} exige payload", self.kind)),
             ),
             (MessageType::Cancel, Some(p)) => CancelPayload::from_value(p).map(|_| ()),
