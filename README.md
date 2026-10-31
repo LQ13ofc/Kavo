@@ -8,7 +8,7 @@ Escopo: sem voz, wake word, STT, TTS, LLM, automação ou UI.
 
 - `docs/KAVO-PROTOCOL.md`: especificação do protocolo e reconciliação 03-PROTOCOLOS × 10-CONTRATOS.
 - `docs/ERROR-TAXONOMY.md`: classes de erro e códigos propostos.
-- `docs/SPEECH-INTENT-CONTRACTS.md`: contratos de STT streaming, Intent Engine e prontidão.
+- `docs/SPEECH-INTENT-CONTRACTS.md`: contratos de STT streaming, Intent Engine, prontidão e persistência durável (§9).
 - `docs/DECISIONS.md`: decisões com status (aprovada, provisória, pendente).
 
 ## Estrutura
@@ -21,7 +21,8 @@ Escopo: sem voz, wake word, STT, TTS, LLM, automação ou UI.
 | `protocol` | `KavoMessage` 1.1, tipos implementados, reservados, entrega, validação |
 | `speech` | contratos de STT streaming e `StreamTracker` (ordem, revisões, timeout) |
 | `intent` | contratos do Intent Engine, `InterpretationTracker` e `ReadinessGate` |
-| `monitor` | assinante do barramento que aplica os contratos (sem ações) |
+| `monitor` | assinante do barramento que aplica os contratos e grava o estado (sem ações) |
+| `store` | SQLite de admissões: transações atômicas, unicidade, restauração (D-031) |
 | `ipc` | NDJSON sobre Unix socket; limite de tamanho; prazo; cliente `ping` |
 | `bus` | barramento interno: filas mpsc por assinante; garantido vs. melhor esforço |
 | `runtime` | trait `Component`, `Supervisor`, `run` (SIGINT/SIGTERM) |
@@ -38,14 +39,16 @@ target/release/kavo ping           # JSON com SUCCESS / FAILED / UNKNOWN
 ```
 
 Configuração opcional em `~/.config/kavo/kavo.toml`. Variáveis: `KAVO_LOG_LEVEL`,
-`KAVO_LOG_JSON`, `KAVO_IPC_SOCKET_PATH`, `KAVO_SHUTDOWN_TIMEOUT_MS`.
+`KAVO_LOG_JSON`, `KAVO_IPC_SOCKET_PATH`, `KAVO_SHUTDOWN_TIMEOUT_MS`, `KAVO_STORE_PATH`.
+
+Banco de admissões: `$XDG_DATA_HOME/kavo/kavo.db` (ou `store.path`). Sem o banco íntegro, o núcleo não inicia.
 
 Socket: `$XDG_RUNTIME_DIR/kavo/kavo.sock` (0600; diretório 0700).
 
 ## Testes
 
 ```bash
-cargo test                          # 88 testes (unitários e integração)
+cargo test                          # 110 testes (unitários e integração)
 cargo clippy --all-targets          # 0 avisos
 ```
 

@@ -112,7 +112,8 @@ Versão 1.1-draft. Mudanças que quebram: incremento de major. Campos opcionais 
   - `INTENT_DETECTED`: obrigatório. Schema em `SPEECH-INTENT-CONTRACTS.md`, seção 2.
   - `CANCEL`: opcional. `{"stream_id": UUID}`. Sem payload, `correlation_id` é obrigatório.
   - `HEARTBEAT` e `ERROR`: não aceitam payload.
-- `error_code` só é permitido em `ERROR`.
+- `error_code` só é permitido em `ERROR` e deve estar na taxonomia aprovada: `1001`–`1007` e `1100` (ver `error_code::KNOWN`). Códigos propostos 2xxx/3xxx não são aceitos até aprovação.
+- Tipos 1.1 (`STT_RESULT`, `INTENT_DETECTED`) e qualquer `payload` exigem `schema_version` 1.1. Em 1.0 são recusados com `UNSUPPORTED_VERSION`.
 - Validação de payload é feita na entrada (IPC) e antes do envio. Payload inválido recebe `ERROR` com `[INVALID_MESSAGE]`.
 - Identificadores tipados no payload: `stream_id`, `segment_id`, `interpretation_id` são UUID v4.
 - Entrega: `STT_RESULT` e `INTENT_DETECTED` são garantidos, porque perder evento de STT altera a sequência.

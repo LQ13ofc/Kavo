@@ -28,6 +28,8 @@ use uuid::Uuid;
 
 // ---------- fixtures ----------
 
+const S: &str = "sessao-teste";
+
 fn speech(stream: Uuid, seq: u64, event: SpeechEvent) -> SpeechPayload {
     SpeechPayload {
         stream_id: stream,
@@ -106,6 +108,7 @@ fn partial_then_confirmed_is_applied_in_order() {
     let (s, seg) = (Uuid::new_v4(), Uuid::new_v4());
     assert_eq!(
         t.apply(
+            S,
             &speech(s, 1, transcript(seg, 0, TranscriptState::Partial, "abre")),
             0
         ),
@@ -113,6 +116,7 @@ fn partial_then_confirmed_is_applied_in_order() {
     );
     assert_eq!(
         t.apply(
+            S,
             &speech(s, 2, transcript(seg, 1, TranscriptState::Partial, "abre o")),
             1
         ),
@@ -120,6 +124,7 @@ fn partial_then_confirmed_is_applied_in_order() {
     );
     assert_eq!(
         t.apply(
+            S,
             &speech(
                 s,
                 3,
@@ -130,7 +135,7 @@ fn partial_then_confirmed_is_applied_in_order() {
         Acceptance::Applied
     );
     assert_eq!(
-        t.segment(&s, &seg),
+        t.segment(S, &s, &seg),
         Some(SegmentSnapshot {
             revision: 2,
             state: TranscriptState::Confirmed
@@ -143,10 +148,12 @@ fn confirmed_segment_rejects_further_revisions() {
     let mut t = StreamTracker::new(4);
     let (s, seg) = (Uuid::new_v4(), Uuid::new_v4());
     t.apply(
+        S,
         &speech(s, 1, transcript(seg, 0, TranscriptState::Confirmed, "fim")),
         0,
     );
     let out = t.apply(
+        S,
         &speech(s, 2, transcript(seg, 1, TranscriptState::Partial, "fim!")),
         1,
     );
@@ -161,10 +168,12 @@ fn revision_skipping_is_rejected_and_sequence_is_consumed() {
     let mut t = StreamTracker::new(4);
     let (s, seg) = (Uuid::new_v4(), Uuid::new_v4());
     t.apply(
+        S,
         &speech(s, 1, transcript(seg, 0, TranscriptState::Partial, "a")),
         0,
     );
     let out = t.apply(
+        S,
         &speech(s, 2, transcript(seg, 2, TranscriptState::Partial, "b")),
         0,
     );
@@ -175,6 +184,7 @@ fn revision_skipping_is_rejected_and_sequence_is_consumed() {
     // Sequência 2 foi consumida: o próximo evento válido é 3.
     assert_eq!(
         t.apply(
+            S,
             &speech(s, 3, transcript(seg, 1, TranscriptState::Partial, "a b")),
             0
         ),
@@ -187,6 +197,7 @@ fn new_segment_must_start_at_revision_zero() {
     let mut t = StreamTracker::new(4);
     let (s, seg) = (Uuid::new_v4(), Uuid::new_v4());
     let out = t.apply(
+        S,
         &speech(s, 1, transcript(seg, 3, TranscriptState::Partial, "x")),
         0,
     );
@@ -199,6 +210,7 @@ fn out_of_order_sequences_are_gap_then_filled() {
     let (s, seg) = (Uuid::new_v4(), Uuid::new_v4());
     assert_eq!(
         t.apply(
+            S,
             &speech(s, 1, SpeechEvent::SpeechStarted { segment_id: seg }),
             0
         ),
@@ -207,6 +219,7 @@ fn out_of_order_sequences_are_gap_then_filled() {
     // 3 chega antes de 2: lacuna, não aplicado.
     assert_eq!(
         t.apply(
+            S,
             &speech(s, 3, transcript(seg, 0, TranscriptState::Partial, "b")),
             0
         ),
@@ -216,11 +229,12 @@ fn out_of_order_sequences_are_gap_then_filled() {
         }
     );
     assert_eq!(
-        t.apply(&speech(s, 2, SpeechEvent::NoSpeech), 0),
+        t.apply(S, &speech(s, 2, SpeechEvent::NoSpeech), 0),
         Acceptance::Applied
     );
     assert_eq!(
         t.apply(
+            S,
             &speech(s, 3, transcript(seg, 0, TranscriptState::Partial, "b")),
             0
         ),
@@ -231,7 +245,7 @@ fn out_of_order_sequences_are_gap_then_filled() {
 #[test]
 fn stream_must_start_at_sequence_one() {
     let mut t = StreamTracker::new(4);
-    let out = t.apply(&speech(Uuid::new_v4(), 2, SpeechEvent::NoSpeech), 0);
+    let out = t.apply(S, &speech(Uuid::new_v4(), 2, SpeechEvent::NoSpeech), 0);
     assert_eq!(
         out,
         Acceptance::Gap {
@@ -246,14 +260,17 @@ fn duplicate_same_content_is_ignored_and_conflicting_reuse_is_rejected() {
     let mut t = StreamTracker::new(4);
     let (s, seg) = (Uuid::new_v4(), Uuid::new_v4());
     let first = speech(s, 1, transcript(seg, 0, TranscriptState::Partial, "liga"));
-    assert_eq!(t.apply(&first, 0), Acceptance::Applied);
-    assert_eq!(t.apply(&first, 1), Acceptance::Duplicate);
+    assert_eq!(t.apply(S, &first, 0), Acceptance::Applied);
+    assert_eq!(t.apply(S, &first, 1), Acceptance::Duplicate);
     let conflicting = speech(
         s,
         1,
         transcript(seg, 0, TranscriptState::Partial, "desliga"),
     );
-    assert!(matches!(t.apply(&conflicting, 2), Acceptance::Rejected(_)));
+    assert!(matches!(
+        t.apply(S, &conflicting, 2),
+        Acceptance::Rejected(_)
+    ));
 }
 
 #[test]
@@ -261,15 +278,15 @@ fn old_sequence_outside_window_is_stale() {
     let mut t = StreamTracker::new(4);
     let s = Uuid::new_v4();
     for seq in 1..=3 {
-        t.apply(&speech(s, seq, SpeechEvent::NoSpeech), 0);
+        t.apply(S, &speech(s, seq, SpeechEvent::NoSpeech), 0);
     }
     assert_eq!(
-        t.apply(&speech(s, 1, SpeechEvent::NoSpeech), 0),
+        t.apply(S, &speech(s, 1, SpeechEvent::NoSpeech), 0),
         Acceptance::Duplicate,
         "janela recente"
     );
     assert_eq!(
-        t.apply(&speech(s, 2, SpeechEvent::NoSpeech), 0),
+        t.apply(S, &speech(s, 2, SpeechEvent::NoSpeech), 0),
         Acceptance::Duplicate
     );
 }
@@ -278,15 +295,15 @@ fn old_sequence_outside_window_is_stale() {
 fn ended_stream_rejects_new_events_but_repeats_end_as_duplicate() {
     let mut t = StreamTracker::new(4);
     let s = Uuid::new_v4();
-    t.apply(&speech(s, 1, SpeechEvent::StreamEnded), 0);
-    assert_eq!(t.status(&s), Some(&StreamStatus::Ended));
-    let out = t.apply(&speech(s, 2, SpeechEvent::NoSpeech), 0);
+    t.apply(S, &speech(s, 1, SpeechEvent::StreamEnded), 0);
+    assert_eq!(t.status(S, &s), Some(&StreamStatus::Ended));
+    let out = t.apply(S, &speech(s, 2, SpeechEvent::NoSpeech), 0);
     assert!(
         matches!(out, Acceptance::Rejected(ref m) if m.contains("encerrado")),
         "{out:?}"
     );
     assert_eq!(
-        t.apply(&speech(s, 1, SpeechEvent::StreamEnded), 0),
+        t.apply(S, &speech(s, 1, SpeechEvent::StreamEnded), 0),
         Acceptance::Duplicate
     );
 }
@@ -296,13 +313,15 @@ fn cancel_stops_stream_and_is_idempotent() {
     let mut t = StreamTracker::new(4);
     let (s, seg) = (Uuid::new_v4(), Uuid::new_v4());
     t.apply(
+        S,
         &speech(s, 1, transcript(seg, 0, TranscriptState::Partial, "abr")),
         0,
     );
-    assert!(t.cancel(&s));
-    assert!(!t.cancel(&s), "já cancelado");
-    assert_eq!(t.status(&s), Some(&StreamStatus::Cancelled));
+    assert!(t.cancel(S, &s));
+    assert!(!t.cancel(S, &s), "já cancelado");
+    assert_eq!(t.status(S, &s), Some(&StreamStatus::Cancelled));
     let out = t.apply(
+        S,
         &speech(s, 2, transcript(seg, 1, TranscriptState::Partial, "abre")),
         1,
     );
@@ -313,28 +332,28 @@ fn cancel_stops_stream_and_is_idempotent() {
 fn idle_stream_times_out_and_active_one_does_not() {
     let mut t = StreamTracker::new(4);
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-    t.apply(&speech(a, 1, SpeechEvent::NoSpeech), 0);
-    t.apply(&speech(b, 1, SpeechEvent::NoSpeech), 900);
+    t.apply(S, &speech(a, 1, SpeechEvent::NoSpeech), 0);
+    t.apply(S, &speech(b, 1, SpeechEvent::NoSpeech), 900);
     let expired = t.expire_idle(1_000, 500);
-    assert_eq!(expired, vec![a]);
-    assert_eq!(t.status(&a), Some(&StreamStatus::TimedOut));
-    assert_eq!(t.status(&b), Some(&StreamStatus::Active));
+    assert_eq!(expired, vec![(S.to_owned(), a)]);
+    assert_eq!(t.status(S, &a), Some(&StreamStatus::TimedOut));
+    assert_eq!(t.status(S, &b), Some(&StreamStatus::Active));
 }
 
 #[test]
 fn stream_capacity_evicts_terminal_only() {
     let mut t = StreamTracker::new(2);
     let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-    t.apply(&speech(a, 1, SpeechEvent::NoSpeech), 0);
-    t.apply(&speech(b, 1, SpeechEvent::NoSpeech), 0);
-    let out = t.apply(&speech(c, 1, SpeechEvent::NoSpeech), 0);
+    t.apply(S, &speech(a, 1, SpeechEvent::NoSpeech), 0);
+    t.apply(S, &speech(b, 1, SpeechEvent::NoSpeech), 0);
+    let out = t.apply(S, &speech(c, 1, SpeechEvent::NoSpeech), 0);
     assert!(
         matches!(out, Acceptance::Rejected(ref m) if m.contains("limite")),
         "{out:?}"
     );
-    t.cancel(&a);
+    t.cancel(S, &a);
     assert_eq!(
-        t.apply(&speech(c, 1, SpeechEvent::NoSpeech), 0),
+        t.apply(S, &speech(c, 1, SpeechEvent::NoSpeech), 0),
         Acceptance::Applied
     );
     assert_eq!(t.len(), 2);
@@ -345,17 +364,18 @@ fn no_speech_and_unintelligible_never_carry_text() {
     let mut t = StreamTracker::new(4);
     let (s, seg) = (Uuid::new_v4(), Uuid::new_v4());
     assert_eq!(
-        t.apply(&speech(s, 1, SpeechEvent::NoSpeech), 0),
+        t.apply(S, &speech(s, 1, SpeechEvent::NoSpeech), 0),
         Acceptance::Applied
     );
     assert_eq!(
         t.apply(
+            S,
             &speech(s, 2, SpeechEvent::Unintelligible { segment_id: seg }),
             0
         ),
         Acceptance::Applied
     );
-    assert!(t.segment(&s, &seg).is_none(), "não cria segmento");
+    assert!(t.segment(S, &s, &seg).is_none(), "não cria segmento");
 }
 
 #[test]
@@ -363,6 +383,7 @@ fn stream_failed_is_terminal() {
     let mut t = StreamTracker::new(4);
     let s = Uuid::new_v4();
     t.apply(
+        S,
         &speech(
             s,
             1,
@@ -372,7 +393,7 @@ fn stream_failed_is_terminal() {
         ),
         0,
     );
-    assert!(matches!(t.status(&s), Some(StreamStatus::Failed(r)) if r == "ENGINE_UNAVAILABLE"));
+    assert!(matches!(t.status(S, &s), Some(StreamStatus::Failed(r)) if r == "ENGINE_UNAVAILABLE"));
 }
 
 // ---------- STT: validação de payload ----------
@@ -540,10 +561,10 @@ fn interpretation_revisions_apply_in_order_and_dedupe() {
         1,
         Some("OPEN_APPLICATION"),
     );
-    assert_eq!(t.apply(&r0), Acceptance::Applied);
-    assert_eq!(t.apply(&r0), Acceptance::Duplicate);
-    assert_eq!(t.apply(&r1), Acceptance::Applied);
-    assert!(matches!(t.apply(&r0), Acceptance::Stale { .. }));
+    assert_eq!(t.apply(S, &r0), Acceptance::Applied);
+    assert_eq!(t.apply(S, &r0), Acceptance::Duplicate);
+    assert_eq!(t.apply(S, &r1), Acceptance::Applied);
+    assert!(matches!(t.apply(S, &r0), Acceptance::Stale { .. }));
 }
 
 #[test]
@@ -551,29 +572,35 @@ fn interpretation_gap_and_source_regression_are_detected() {
     let mut t = InterpretationTracker::default();
     let (seg, s) = (Uuid::new_v4(), Uuid::new_v4());
     let r2 = interp(seg, s, InterpretationState::Provisional, 2, None);
-    assert!(matches!(t.apply(&r2), Acceptance::Gap { .. }));
+    assert!(matches!(t.apply(S, &r2), Acceptance::Gap { .. }));
 
     let mut r0 = interp(seg, s, InterpretationState::Provisional, 0, None);
     r0.source_revision = 3;
-    t.apply(&r0);
+    t.apply(S, &r0);
     let mut r1 = interp(seg, s, InterpretationState::Provisional, 1, None);
     r1.source_revision = 2;
-    assert!(matches!(t.apply(&r1), Acceptance::Rejected(ref m) if m.contains("regrediu")));
+    assert!(matches!(t.apply(S, &r1), Acceptance::Rejected(ref m) if m.contains("regrediu")));
 }
 
 #[test]
 fn cancelled_interpretation_rejects_later_revisions() {
     let mut t = InterpretationTracker::default();
     let (seg, s) = (Uuid::new_v4(), Uuid::new_v4());
-    t.apply(&interp(seg, s, InterpretationState::Provisional, 0, None));
-    assert_eq!(t.cancel_stream(&s), 1);
-    let out = t.apply(&interp(
-        seg,
-        s,
-        InterpretationState::Stable,
-        1,
-        Some("OPEN_APPLICATION"),
-    ));
+    t.apply(
+        S,
+        &interp(seg, s, InterpretationState::Provisional, 0, None),
+    );
+    assert_eq!(t.cancel_stream(S, &s), 1);
+    let out = t.apply(
+        S,
+        &interp(
+            seg,
+            s,
+            InterpretationState::Stable,
+            1,
+            Some("OPEN_APPLICATION"),
+        ),
+    );
     assert!(matches!(out, Acceptance::Rejected(_)), "{out:?}");
 }
 
@@ -581,7 +608,7 @@ fn cancelled_interpretation_rejects_later_revisions() {
 
 #[test]
 fn provisional_never_admits() {
-    let mut gate = ReadinessGate::new(None);
+    let gate = ReadinessGate::new(None);
     let (seg, s) = (Uuid::new_v4(), Uuid::new_v4());
     let p = interp(
         seg,
@@ -591,14 +618,14 @@ fn provisional_never_admits() {
         Some("OPEN_APPLICATION"),
     );
     assert_eq!(
-        gate.evaluate(&p, confirmed_source(0), RiskClass::Read, false),
+        gate.evaluate(S, &p, confirmed_source(0), RiskClass::Read, false),
         Decision::NotReady(NotReadyReason::Provisional)
     );
 }
 
 #[test]
 fn stable_on_partial_source_is_not_admitted() {
-    let mut gate = ReadinessGate::new(None);
+    let gate = ReadinessGate::new(None);
     let (seg, s) = (Uuid::new_v4(), Uuid::new_v4());
     let p = interp(
         seg,
@@ -608,7 +635,7 @@ fn stable_on_partial_source_is_not_admitted() {
         Some("OPEN_APPLICATION"),
     );
     assert_eq!(
-        gate.evaluate(&p, partial_source(0), RiskClass::Read, false),
+        gate.evaluate(S, &p, partial_source(0), RiskClass::Read, false),
         Decision::NotReady(NotReadyReason::SourceUnconfirmed)
     );
 }
@@ -625,11 +652,11 @@ fn stable_on_confirmed_source_admits_once_then_reports_duplicate() {
         Some("OPEN_APPLICATION"),
     );
     assert!(matches!(
-        gate.evaluate(&p, confirmed_source(0), RiskClass::Read, false),
+        decide(&mut gate, &p, confirmed_source(0), RiskClass::Read, false),
         Decision::Admit(_)
     ));
     assert!(matches!(
-        gate.evaluate(&p, confirmed_source(0), RiskClass::Read, false),
+        decide(&mut gate, &p, confirmed_source(0), RiskClass::Read, false),
         Decision::Duplicate(_)
     ));
 }
@@ -646,16 +673,16 @@ fn intent_change_on_same_segment_supersedes_admission() {
         Some("OPEN_APPLICATION"),
     );
     let b = interp(seg, s, InterpretationState::Stable, 2, Some("GET_TIME"));
-    gate.evaluate(&a, confirmed_source(0), RiskClass::Read, false);
+    decide(&mut gate, &a, confirmed_source(0), RiskClass::Read, false);
     assert!(matches!(
-        gate.evaluate(&b, confirmed_source(0), RiskClass::Read, false),
+        decide(&mut gate, &b, confirmed_source(0), RiskClass::Read, false),
         Decision::Supersede { .. }
     ));
 }
 
 #[test]
 fn source_revised_after_interpretation_is_not_admitted() {
-    let mut gate = ReadinessGate::new(None);
+    let gate = ReadinessGate::new(None);
     let (seg, s) = (Uuid::new_v4(), Uuid::new_v4());
     let p = interp(
         seg,
@@ -665,22 +692,22 @@ fn source_revised_after_interpretation_is_not_admitted() {
         Some("OPEN_APPLICATION"),
     );
     assert_eq!(
-        gate.evaluate(&p, confirmed_source(1), RiskClass::Read, false),
+        gate.evaluate(S, &p, confirmed_source(1), RiskClass::Read, false),
         Decision::NotReady(NotReadyReason::SourceRevised { current: 1 })
     );
 }
 
 #[test]
 fn sensitive_action_needs_policy_confirmation_even_if_stable() {
-    let mut gate = ReadinessGate::new(None);
+    let gate = ReadinessGate::new(None);
     let (seg, s) = (Uuid::new_v4(), Uuid::new_v4());
     let p = interp(seg, s, InterpretationState::Stable, 0, Some("DELETE_FILE"));
     assert_eq!(
-        gate.evaluate(&p, confirmed_source(0), RiskClass::Irreversible, false),
+        gate.evaluate(S, &p, confirmed_source(0), RiskClass::Irreversible, false),
         Decision::NotReady(NotReadyReason::ConfirmationRequired)
     );
     assert!(matches!(
-        gate.evaluate(&p, confirmed_source(0), RiskClass::Irreversible, true),
+        gate.evaluate(S, &p, confirmed_source(0), RiskClass::Irreversible, true),
         Decision::Admit(_)
     ));
 }
@@ -698,12 +725,12 @@ fn confidence_threshold_is_never_invented() {
 
     // Sem limite configurado: admite sem confiança informada.
     assert!(matches!(
-        ReadinessGate::new(None).evaluate(&p, confirmed_source(0), RiskClass::Read, false),
+        ReadinessGate::new(None).evaluate(S, &p, confirmed_source(0), RiskClass::Read, false),
         Decision::Admit(_)
     ));
     // Com limite configurado e confiança ausente: não admite.
     assert_eq!(
-        ReadinessGate::new(Some(0.8)).evaluate(&p, confirmed_source(0), RiskClass::Read, false),
+        ReadinessGate::new(Some(0.8)).evaluate(S, &p, confirmed_source(0), RiskClass::Read, false),
         Decision::NotReady(NotReadyReason::BelowMinConfidence)
     );
     p.intent = Some(IntentCandidate {
@@ -711,14 +738,14 @@ fn confidence_threshold_is_never_invented() {
         confidence: Some(0.9),
     });
     assert!(matches!(
-        ReadinessGate::new(Some(0.8)).evaluate(&p, confirmed_source(0), RiskClass::Read, false),
+        ReadinessGate::new(Some(0.8)).evaluate(S, &p, confirmed_source(0), RiskClass::Read, false),
         Decision::Admit(_)
     ));
 }
 
 #[test]
 fn inactive_stream_blocks_admission() {
-    let mut gate = ReadinessGate::new(None);
+    let gate = ReadinessGate::new(None);
     let (seg, s) = (Uuid::new_v4(), Uuid::new_v4());
     let p = interp(
         seg,
@@ -732,14 +759,14 @@ fn inactive_stream_blocks_admission() {
         ..confirmed_source(0)
     };
     assert_eq!(
-        gate.evaluate(&p, src, RiskClass::Read, false),
+        gate.evaluate(S, &p, src, RiskClass::Read, false),
         Decision::NotReady(NotReadyReason::StreamInactive)
     );
 }
 
 #[test]
 fn clarification_and_no_intent_never_admit() {
-    let mut gate = ReadinessGate::new(None);
+    let gate = ReadinessGate::new(None);
     let (seg, s) = (Uuid::new_v4(), Uuid::new_v4());
     let mut clar = interp(seg, s, InterpretationState::NeedsClarification, 0, None);
     clar.ambiguities = vec![Ambiguity {
@@ -747,12 +774,12 @@ fn clarification_and_no_intent_never_admit() {
         options: vec!["a".into(), "b".into()],
     }];
     assert_eq!(
-        gate.evaluate(&clar, confirmed_source(0), RiskClass::Read, false),
+        gate.evaluate(S, &clar, confirmed_source(0), RiskClass::Read, false),
         Decision::NotReady(NotReadyReason::NeedsClarification)
     );
     let none = interp(seg, s, InterpretationState::NoIntent, 0, None);
     assert_eq!(
-        gate.evaluate(&none, confirmed_source(0), RiskClass::Read, false),
+        gate.evaluate(S, &none, confirmed_source(0), RiskClass::Read, false),
         Decision::NotReady(NotReadyReason::NoIntent)
     );
 }
@@ -852,6 +879,14 @@ fn reserved_types_are_still_unsupported() {
 
 // ---------- Monitor no barramento ----------
 
+/// Banco SQLite isolado por teste. O diretório fica vivo enquanto o processo de teste existir.
+fn temp_store() -> kavo::store::Store {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kavo.db");
+    std::mem::forget(dir);
+    kavo::store::Store::open(&path).unwrap()
+}
+
 fn monitor_setup(
     cfg: SpeechConfig,
 ) -> (
@@ -863,7 +898,7 @@ fn monitor_setup(
     let bus = EventBus::new(64, Duration::from_secs(2));
     let rx = bus.subscribe();
     let stats: Arc<Mutex<MonitorStats>> = Default::default();
-    let monitor = ContractMonitor::new(rx, &cfg, stats.clone());
+    let monitor = ContractMonitor::open(rx, &cfg, stats.clone(), temp_store()).unwrap();
     let cancel = CancellationToken::new();
     let ctx = ComponentContext {
         cancel: cancel.clone(),
@@ -897,7 +932,7 @@ async fn monitor_applies_stt_and_admits_once_end_to_end() {
         Some("OPEN_APPLICATION"),
     );
     based.source_revision = 1;
-    let mut intent = KavoMessage::new(MessageType::IntentDetected, "s", "intent-fixture");
+    let mut intent = KavoMessage::new(MessageType::IntentDetected, "sessao-e2e", "intent-fixture");
     intent.payload = Some(serde_json::to_value(based).unwrap());
     bus.publish(intent.clone()).await.unwrap();
     // Reenvio idêntico: duplicata de transporte, ignorada pelo rastreador de interpretações.
@@ -905,7 +940,7 @@ async fn monitor_applies_stt_and_admits_once_end_to_end() {
     // Nova revisão com a mesma intenção e mesmos parâmetros: não pode executar de novo.
     let mut again = based_revision_one(seg, s);
     again.revision = 1;
-    let mut intent2 = KavoMessage::new(MessageType::IntentDetected, "s", "intent-fixture");
+    let mut intent2 = KavoMessage::new(MessageType::IntentDetected, "sessao-e2e", "intent-fixture");
     intent2.payload = Some(serde_json::to_value(again).unwrap());
     bus.publish(intent2).await.unwrap();
 
@@ -941,7 +976,7 @@ async fn monitor_handles_out_of_order_and_cancel_stream() {
     bus.publish(stt_message(seg, s, 3, 1, "PARTIAL", "a b"))
         .await
         .unwrap(); // lacuna
-    let mut cancel_msg = KavoMessage::new(MessageType::Cancel, "s", "cli");
+    let mut cancel_msg = KavoMessage::new(MessageType::Cancel, "sessao-e2e", "cli");
     cancel_msg.payload = Some(json!({"stream_id": s}));
     bus.publish(cancel_msg).await.unwrap();
     bus.publish(stt_message(seg, s, 2, 1, "PARTIAL", "a b"))
@@ -1001,11 +1036,9 @@ async fn start_core(
     let rx = bus.subscribe();
     let stats: Arc<Mutex<MonitorStats>> = Default::default();
     let mut sup = Supervisor::new(bus.clone());
-    sup.spawn(ContractMonitor::new(
-        rx,
-        &SpeechConfig::default(),
-        stats.clone(),
-    ));
+    sup.spawn(
+        ContractMonitor::open(rx, &SpeechConfig::default(), stats.clone(), temp_store()).unwrap(),
+    );
     let server = IpcServer::bind(path, settings()).unwrap();
     let cancel = sup.cancel_token();
     let handle = tokio::spawn(async move {
@@ -1086,10 +1119,10 @@ async fn stt_result_over_socket_is_accepted_without_reply_and_invalid_gets_error
 fn gap_counts_as_producer_activity_for_timeout() {
     let mut t = StreamTracker::new(4);
     let s = Uuid::new_v4();
-    t.apply(&speech(s, 1, SpeechEvent::NoSpeech), 0);
+    t.apply(S, &speech(s, 1, SpeechEvent::NoSpeech), 0);
     // Lacuna em t=900: o produtor está vivo, mesmo sem evento aplicado.
     assert_eq!(
-        t.apply(&speech(s, 3, SpeechEvent::NoSpeech), 900),
+        t.apply(S, &speech(s, 3, SpeechEvent::NoSpeech), 900),
         Acceptance::Gap {
             expected: 2,
             got: 3
@@ -1105,14 +1138,14 @@ fn gap_counts_as_producer_activity_for_timeout() {
 fn cancelled_or_evicted_stream_cannot_be_reopened_with_sequence_one() {
     let mut t = StreamTracker::new(1);
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-    t.apply(&speech(a, 1, SpeechEvent::NoSpeech), 0);
-    assert!(t.cancel(&a));
+    t.apply(S, &speech(a, 1, SpeechEvent::NoSpeech), 0);
+    assert!(t.cancel(S, &a));
     // Novo stream força a remoção do terminal `a`.
     assert_eq!(
-        t.apply(&speech(b, 1, SpeechEvent::NoSpeech), 1),
+        t.apply(S, &speech(b, 1, SpeechEvent::NoSpeech), 1),
         Acceptance::Applied
     );
-    let out = t.apply(&speech(a, 1, SpeechEvent::NoSpeech), 2);
+    let out = t.apply(S, &speech(a, 1, SpeechEvent::NoSpeech), 2);
     assert!(
         matches!(out, Acceptance::Rejected(ref m) if m.contains("reaberto")),
         "{out:?}"
@@ -1124,22 +1157,28 @@ fn interpretation_cannot_switch_segment_or_stream() {
     let mut t = InterpretationTracker::default();
     let (seg_a, seg_b, s) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     assert_eq!(
-        t.apply(&interp(
-            seg_a,
-            s,
-            InterpretationState::Stable,
-            0,
-            Some("OPEN_APPLICATION")
-        )),
+        t.apply(
+            S,
+            &interp(
+                seg_a,
+                s,
+                InterpretationState::Stable,
+                0,
+                Some("OPEN_APPLICATION")
+            )
+        ),
         Acceptance::Applied
     );
-    let out = t.apply(&interp(
-        seg_b,
-        s,
-        InterpretationState::Stable,
-        1,
-        Some("OPEN_APPLICATION"),
-    ));
+    let out = t.apply(
+        S,
+        &interp(
+            seg_b,
+            s,
+            InterpretationState::Stable,
+            1,
+            Some("OPEN_APPLICATION"),
+        ),
+    );
     assert!(
         matches!(out, Acceptance::Rejected(ref m) if m.contains("trocar")),
         "{out:?}"
@@ -1154,6 +1193,7 @@ fn segments_per_stream_are_capped() {
         let seg = Uuid::new_v4();
         assert_eq!(
             t.apply(
+                S,
                 &speech(s, seq, transcript(seg, 0, TranscriptState::Partial, "x")),
                 0
             ),
@@ -1166,12 +1206,12 @@ fn segments_per_stream_are_capped() {
         transcript(Uuid::new_v4(), 0, TranscriptState::Partial, "y"),
     );
     assert!(
-        matches!(t.apply(&extra, 0), Acceptance::Rejected(ref m) if m.contains("limite de segmentos"))
+        matches!(t.apply(S, &extra, 0), Acceptance::Rejected(ref m) if m.contains("limite de segmentos"))
     );
 }
 
 #[test]
-fn admission_is_forgotten_when_stream_is_released() {
+fn admission_persists_so_reopened_or_resent_source_never_executes_twice() {
     let mut gate = ReadinessGate::new(None);
     let (seg, s) = (Uuid::new_v4(), Uuid::new_v4());
     let p = interp(
@@ -1182,12 +1222,46 @@ fn admission_is_forgotten_when_stream_is_released() {
         Some("OPEN_APPLICATION"),
     );
     assert!(matches!(
-        gate.evaluate(&p, confirmed_source(0), RiskClass::Read, false),
+        decide(&mut gate, &p, confirmed_source(0), RiskClass::Read, false),
         Decision::Admit(_)
     ));
-    gate.forget_stream(&s);
+    // Mesmo segmento confirmado, outra interpretação com o mesmo conteúdo: não executa de novo.
+    let again = interp(
+        seg,
+        Uuid::new_v4(),
+        InterpretationState::Stable,
+        1,
+        Some("OPEN_APPLICATION"),
+    );
     assert!(matches!(
-        gate.evaluate(&p, confirmed_source(0), RiskClass::Read, false),
+        decide(
+            &mut gate,
+            &again,
+            confirmed_source(0),
+            RiskClass::Read,
+            false
+        ),
+        Decision::Duplicate(_)
+    ));
+}
+
+#[test]
+fn same_segment_in_other_session_is_independent() {
+    let gate = ReadinessGate::new(None);
+    let (seg, s) = (Uuid::new_v4(), Uuid::new_v4());
+    let p = interp(
+        seg,
+        s,
+        InterpretationState::Stable,
+        0,
+        Some("OPEN_APPLICATION"),
+    );
+    assert!(matches!(
+        gate.evaluate("sessao-a", &p, confirmed_source(0), RiskClass::Read, false),
+        Decision::Admit(_)
+    ));
+    assert!(matches!(
+        gate.evaluate("sessao-b", &p, confirmed_source(0), RiskClass::Read, false),
         Decision::Admit(_)
     ));
 }
@@ -1226,4 +1300,205 @@ fn acceptance_labels_hide_reasons() {
         "REJECTED"
     );
     assert!(StreamStatus::Failed("x".into()).is_terminal());
+}
+
+// ---------- Revisão de segurança (Phase 4.2 final) ----------
+
+#[test]
+fn error_code_must_be_in_approved_taxonomy() {
+    let mut ok = KavoMessage::new(MessageType::Error, "s", "x");
+    ok.error_code = Some(1002);
+    assert!(ok.validate().is_ok());
+    ok.error_code = Some(1100);
+    assert!(ok.validate().is_ok());
+    for bad in [0u16, 999, 1008, 1101, 2001, 3001, 65535] {
+        let mut m = KavoMessage::new(MessageType::Error, "s", "x");
+        m.error_code = Some(bad);
+        assert!(
+            m.validate().is_err(),
+            "código {bad} não está na taxonomia aprovada"
+        );
+    }
+}
+
+#[test]
+fn stream_cannot_be_reopened_after_many_evictions() {
+    let mut t = StreamTracker::new(1);
+    let first = Uuid::new_v4();
+    t.apply(S, &speech(first, 1, SpeechEvent::NoSpeech), 0);
+    assert!(t.cancel(S, &first));
+    // Muitas remoções por capacidade: o aposentado não volta a ser aceito.
+    for _ in 0..300 {
+        let other = Uuid::new_v4();
+        assert_eq!(
+            t.apply(S, &speech(other, 1, SpeechEvent::NoSpeech), 0),
+            Acceptance::Applied
+        );
+        t.cancel(S, &other);
+    }
+    let out = t.apply(S, &speech(first, 1, SpeechEvent::NoSpeech), 1);
+    assert!(
+        matches!(out, Acceptance::Rejected(ref m) if m.contains("reaberto")),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn cancel_before_first_event_prevents_stream_start() {
+    let mut t = StreamTracker::new(4);
+    let s_id = Uuid::new_v4();
+    assert!(
+        !t.cancel(S, &s_id),
+        "cancelar stream desconhecido não muda estado"
+    );
+    let out = t.apply(S, &speech(s_id, 1, SpeechEvent::NoSpeech), 0);
+    assert!(matches!(out, Acceptance::Rejected(_)), "{out:?}");
+}
+
+#[test]
+fn same_stream_id_in_two_sessions_is_isolated() {
+    let mut t = StreamTracker::new(4);
+    let s_id = Uuid::new_v4();
+    assert_eq!(
+        t.apply("sessao-a", &speech(s_id, 1, SpeechEvent::NoSpeech), 0),
+        Acceptance::Applied
+    );
+    assert_eq!(
+        t.apply("sessao-b", &speech(s_id, 1, SpeechEvent::NoSpeech), 0),
+        Acceptance::Applied
+    );
+    // Cancelar na sessão B não afeta a A.
+    assert!(t.cancel("sessao-b", &s_id));
+    assert_eq!(t.status("sessao-a", &s_id), Some(&StreamStatus::Active));
+    assert_eq!(t.status("sessao-b", &s_id), Some(&StreamStatus::Cancelled));
+}
+
+#[test]
+fn cancel_is_idempotent_and_terminal_states_are_not_changed() {
+    let mut t = StreamTracker::new(4);
+    let s_id = Uuid::new_v4();
+    t.apply(S, &speech(s_id, 1, SpeechEvent::StreamEnded), 0);
+    assert!(
+        !t.cancel(S, &s_id),
+        "stream já encerrado não vira cancelado"
+    );
+    assert_eq!(t.status(S, &s_id), Some(&StreamStatus::Ended));
+}
+
+#[test]
+fn interpretation_from_other_session_does_not_collide() {
+    let mut t = InterpretationTracker::default();
+    let (seg, s) = (Uuid::new_v4(), Uuid::new_v4());
+    let p = interp(seg, s, InterpretationState::Provisional, 0, None);
+    assert_eq!(t.apply("sessao-a", &p), Acceptance::Applied);
+    assert_eq!(t.apply("sessao-b", &p), Acceptance::Applied);
+    assert_eq!(t.cancel_stream("sessao-a", &s), 1);
+    let mut r1 = interp(
+        seg,
+        s,
+        InterpretationState::Stable,
+        1,
+        Some("OPEN_APPLICATION"),
+    );
+    r1.source_revision = 0;
+    assert_eq!(
+        t.apply("sessao-b", &r1),
+        Acceptance::Applied,
+        "cancelamento de A não afeta B"
+    );
+}
+
+#[test]
+fn stale_interpretation_after_newer_revision_is_not_accepted() {
+    let mut t = InterpretationTracker::default();
+    let (seg, s) = (Uuid::new_v4(), Uuid::new_v4());
+    let r0 = interp(seg, s, InterpretationState::Provisional, 0, None);
+    let mut r2 = interp(
+        seg,
+        s,
+        InterpretationState::Stable,
+        2,
+        Some("OPEN_APPLICATION"),
+    );
+    r2.source_revision = 1;
+    assert_eq!(t.apply(S, &r0), Acceptance::Applied);
+    // r2 chega sem r1: lacuna, não aplicada.
+    assert!(matches!(t.apply(S, &r2), Acceptance::Gap { .. }));
+    let mut r1 = interp(seg, s, InterpretationState::Provisional, 1, None);
+    r1.source_revision = 0;
+    assert_eq!(t.apply(S, &r1), Acceptance::Applied);
+    assert_eq!(t.apply(S, &r2), Acceptance::Applied);
+    // Revisão antiga, mesmo que estável, não volta depois da mais nova.
+    assert!(matches!(t.apply(S, &r1), Acceptance::Stale { .. }));
+}
+
+#[test]
+fn stable_interpretation_is_not_admitted_for_unconfirmed_revision_even_if_later() {
+    let gate = ReadinessGate::new(None);
+    let (seg, s) = (Uuid::new_v4(), Uuid::new_v4());
+    let mut p = interp(
+        seg,
+        s,
+        InterpretationState::Stable,
+        3,
+        Some("OPEN_APPLICATION"),
+    );
+    p.source_revision = 1;
+    // Segmento confirmado na revisão 2: a interpretação baseada na 1 está defasada.
+    let src = SourceSnapshot {
+        stream_active: true,
+        segment: Some(SegmentSnapshot {
+            revision: 2,
+            state: TranscriptState::Confirmed,
+        }),
+    };
+    assert_eq!(
+        gate.evaluate(S, &p, src, RiskClass::Read, false),
+        Decision::NotReady(NotReadyReason::SourceRevised { current: 2 })
+    );
+}
+
+#[test]
+fn compatibility_1_0_messages_still_accepted_and_1_1_types_gated() {
+    let mut hb = KavoMessage::new(MessageType::Heartbeat, "s", "x");
+    hb.schema_version = "1.0".into();
+    assert!(hb.validate().is_ok());
+
+    let mut err = KavoMessage::new(MessageType::Error, "s", "x");
+    err.schema_version = "1.0".into();
+    err.error_code = Some(1100);
+    assert!(err.validate().is_ok());
+
+    let mut cancel = KavoMessage::new(MessageType::Cancel, "s", "x")
+        .with_correlation_id(Uuid::new_v4().to_string());
+    cancel.schema_version = "1.0".into();
+    assert!(cancel.validate().is_ok());
+
+    let mut stt = stt_message(Uuid::new_v4(), Uuid::new_v4(), 1, 0, "PARTIAL", "oi");
+    stt.schema_version = "1.0".into();
+    assert_eq!(
+        stt.validate().unwrap_err().kind(),
+        ErrorKind::UnsupportedVersion
+    );
+
+    let mut cancel_payload = KavoMessage::new(MessageType::Cancel, "s", "x");
+    cancel_payload.schema_version = "1.0".into();
+    cancel_payload.payload = Some(json!({"stream_id": Uuid::new_v4()}));
+    assert_eq!(
+        cancel_payload.validate().unwrap_err().kind(),
+        ErrorKind::UnsupportedVersion
+    );
+}
+
+/// Aplica a decisão como se já estivesse gravada (`record` só roda depois do commit no monitor).
+fn decide(
+    gate: &mut ReadinessGate,
+    p: &InterpretationPayload,
+    src: SourceSnapshot,
+    risk: RiskClass,
+    policy: bool,
+) -> Decision {
+    let d = gate.evaluate(S, p, src, risk, policy);
+    gate.record(S, p.segment_id, &d);
+    d
 }

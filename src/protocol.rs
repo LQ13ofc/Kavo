@@ -47,6 +47,22 @@ pub mod error_code {
     pub const WAKE_WORD_MODEL_ERROR: u16 = 1007;
     /// Provisório: usado para todo erro de protocolo, transporte e interno até a taxonomia ser aprovada.
     pub const GENERIC_ERROR: u16 = 1100;
+
+    /// Códigos aprovados ou provisórios. Códigos propostos (2xxx/3xxx) não entram aqui até aprovação.
+    pub const KNOWN: &[u16] = &[
+        STT_AUDIO_ERROR,
+        STT_MODEL_ERROR,
+        INTENT_PARSING_ERROR,
+        COMMAND_NOT_ALLOWED,
+        COMMAND_TIMEOUT,
+        MEMORY_STORAGE_ERROR,
+        WAKE_WORD_MODEL_ERROR,
+        GENERIC_ERROR,
+    ];
+
+    pub fn is_known(code: u16) -> bool {
+        KNOWN.contains(&code)
+    }
 }
 
 /// Tipos implementados em 1.1-draft.
@@ -77,6 +93,11 @@ impl MessageType {
                 Delivery::Guaranteed
             }
         }
+    }
+
+    /// Tipos introduzidos na 1.1.
+    pub fn requires_minor_1_1(self) -> bool {
+        matches!(self, Self::SttResult | Self::IntentDetected)
     }
 
     /// Tipos que carregam `payload`.
@@ -190,9 +211,22 @@ impl KavoMessage {
             return Err(KavoError::Protocol("timestamp inválido".to_owned()));
         }
 
+        // Tipos 1.1 e payload exigem schema 1.1. Mensagem 1.0 com eles é recusada, não interpretada.
+        if (self.kind.requires_minor_1_1() || self.payload.is_some()) && self.minor() < 1 {
+            return Err(KavoError::UnsupportedVersion(format!(
+                "{:?} com payload exige schema_version 1.1 (recebido {})",
+                self.kind, self.schema_version
+            )));
+        }
+
         match self.kind {
             MessageType::Error if self.error_code.is_none() => {
                 return Err(KavoError::Protocol("ERROR sem error_code".to_owned()));
+            }
+            MessageType::Error if !error_code::is_known(self.error_code.unwrap_or_default()) => {
+                return Err(KavoError::Protocol(
+                    "error_code fora da taxonomia aprovada".to_owned(),
+                ));
             }
             MessageType::Heartbeat
             | MessageType::Cancel
@@ -207,6 +241,14 @@ impl KavoMessage {
             _ => {}
         }
         self.validate_payload()
+    }
+
+    /// Número menor de `schema_version` (`1.x` → `x`). Só válido depois de `validate` ter aceitado a versão.
+    pub fn minor(&self) -> u32 {
+        self.schema_version
+            .split_once('.')
+            .and_then(|(_, minor)| minor.parse().ok())
+            .unwrap_or(0)
     }
 
     fn validate_payload(&self) -> Result<()> {

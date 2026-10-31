@@ -6,7 +6,7 @@
 //!   Lacuna (`Gap`) não é aplicada; o produtor deve reenviar a partir de `expected`.
 //! - Texto nunca é comando. Esta camada só valida e rastreia; não executa nada.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -20,8 +20,6 @@ pub const MAX_REASON_CHARS: usize = 128;
 const DIGEST_WINDOW: usize = 64;
 /// Segmentos por stream. Acima disso, a transcrição nova é rejeitada.
 pub const MAX_SEGMENTS_PER_STREAM: usize = 256;
-/// Ids de streams removidos por capacidade, lembrados para impedir reabertura com `sequence` 1.
-const RETIRED_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -198,34 +196,38 @@ struct StreamState {
     last_activity_ms: u64,
 }
 
+/// Identidade de um stream: sessão + `stream_id`. Mesmo `stream_id` em outra sessão é outro stream.
+pub type StreamKey = (String, Uuid);
+
 /// Rastreia streams de STT: ordem, duplicatas, revisões, estados terminais e timeout.
+///
+/// Identidade: um stream encerrado, cancelado ou removido por capacidade fica em `retired` para sempre
+/// (no processo). Por isso nunca é reaberto, mesmo após a remoção do seu estado. Limitação: a lista
+/// não sobrevive a reinício do núcleo (ver `SPEECH-INTENT-CONTRACTS.md`).
 #[derive(Debug)]
 pub struct StreamTracker {
-    streams: HashMap<Uuid, StreamState>,
+    streams: HashMap<StreamKey, StreamState>,
+    retired: HashSet<StreamKey>,
     max_streams: usize,
-    retired: VecDeque<Uuid>,
 }
 
 impl StreamTracker {
     pub fn new(max_streams: usize) -> Self {
         Self {
             streams: HashMap::new(),
+            retired: HashSet::new(),
             max_streams: max_streams.max(1),
-            retired: VecDeque::new(),
         }
     }
 
     /// Aplica um evento. `now_ms` é o relógio monotônico do núcleo, usado para timeout.
-    pub fn apply(&mut self, payload: &SpeechPayload, now_ms: u64) -> Acceptance {
+    pub fn apply(&mut self, session: &str, payload: &SpeechPayload, now_ms: u64) -> Acceptance {
         let content = canonical_of(payload);
-        let id = payload.stream_id;
+        let key: StreamKey = (session.to_owned(), payload.stream_id);
 
-        let is_new = !self.streams.contains_key(&id);
-        if is_new {
-            if self.retired.contains(&id) {
-                return Acceptance::Rejected(
-                    "stream encerrado e removido não pode ser reaberto".to_owned(),
-                );
+        if !self.streams.contains_key(&key) {
+            if self.retired.contains(&key) {
+                return Acceptance::Rejected("stream encerrado não pode ser reaberto".to_owned());
             }
             if payload.sequence != 1 {
                 return Acceptance::Gap {
@@ -237,7 +239,7 @@ impl StreamTracker {
                 return Acceptance::Rejected("limite de streams ativos atingido".to_owned());
             }
             self.streams.insert(
-                id,
+                key.clone(),
                 StreamState {
                     status: StreamStatus::Active,
                     last_sequence: 0,
@@ -247,7 +249,10 @@ impl StreamTracker {
                 },
             );
         }
-        let stream = self.streams.get_mut(&id).expect("stream inserido acima");
+        let stream = self
+            .streams
+            .get_mut(&key)
+            .expect("stream presente ou inserido acima");
 
         if let Some((_, known)) = stream
             .recent
@@ -292,44 +297,68 @@ impl StreamTracker {
         }
     }
 
-    /// Cancela um stream ativo. Retorna `false` se não existir ou já estiver encerrado.
-    pub fn cancel(&mut self, stream_id: &Uuid) -> bool {
-        match self.streams.get_mut(stream_id) {
+    /// Cancela um stream ativo. Se o stream ainda não existe, grava um aposento: ele não poderá começar.
+    /// Retorna `true` só se houve mudança de estado.
+    pub fn cancel(&mut self, session: &str, stream_id: &Uuid) -> bool {
+        let key: StreamKey = (session.to_owned(), *stream_id);
+        match self.streams.get_mut(&key) {
             Some(stream) if !stream.status.is_terminal() => {
                 stream.status = StreamStatus::Cancelled;
                 true
             }
-            _ => false,
+            Some(_) => false,
+            None => {
+                self.retired.insert(key);
+                false
+            }
         }
     }
 
-    /// Marca como expirados os streams ativos sem atividade há `idle_ms`. Retorna os ids expirados.
-    pub fn expire_idle(&mut self, now_ms: u64, idle_ms: u64) -> Vec<Uuid> {
+    /// Marca como expirados os streams ativos sem atividade há `idle_ms`. Retorna as chaves expiradas.
+    pub fn expire_idle(&mut self, now_ms: u64, idle_ms: u64) -> Vec<StreamKey> {
         let mut expired = Vec::new();
-        for (id, stream) in &mut self.streams {
+        for (key, stream) in &mut self.streams {
             if !stream.status.is_terminal()
                 && now_ms.saturating_sub(stream.last_activity_ms) >= idle_ms
             {
                 stream.status = StreamStatus::TimedOut;
-                expired.push(*id);
+                expired.push(key.clone());
             }
         }
         expired
     }
 
-    pub fn status(&self, stream_id: &Uuid) -> Option<&StreamStatus> {
-        self.streams.get(stream_id).map(|s| &s.status)
+    pub fn status(&self, session: &str, stream_id: &Uuid) -> Option<&StreamStatus> {
+        self.streams
+            .get(&(session.to_owned(), *stream_id))
+            .map(|s| &s.status)
     }
 
-    pub fn segment(&self, stream_id: &Uuid, segment_id: &Uuid) -> Option<SegmentSnapshot> {
+    pub fn segment(
+        &self,
+        session: &str,
+        stream_id: &Uuid,
+        segment_id: &Uuid,
+    ) -> Option<SegmentSnapshot> {
         self.streams
-            .get(stream_id)?
+            .get(&(session.to_owned(), *stream_id))?
             .segments
             .get(segment_id)
             .map(|s| SegmentSnapshot {
                 revision: s.revision,
                 state: s.state,
             })
+    }
+
+    /// Carrega streams aposentados do banco. Nenhum deles pode voltar a aceitar eventos.
+    pub fn restore_retired(&mut self, keys: impl IntoIterator<Item = StreamKey>) {
+        self.retired.extend(keys);
+    }
+
+    /// `true` se o stream nunca foi visto (nem ativo, nem aposentado).
+    pub fn is_unknown(&self, session: &str, stream_id: &Uuid) -> bool {
+        let key: StreamKey = (session.to_owned(), *stream_id);
+        !self.streams.contains_key(&key) && !self.retired.contains(&key)
     }
 
     pub fn len(&self) -> usize {
@@ -340,25 +369,21 @@ impl StreamTracker {
         self.streams.is_empty()
     }
 
-    /// Libera espaço removendo um stream terminal. Retorna `false` se todos estiverem ativos.
+    /// Libera espaço removendo o terminal menos recente. O id continua aposentado. `false` se todos estão ativos.
     fn make_room(&mut self) -> bool {
         if self.streams.len() < self.max_streams {
             return true;
         }
-        // Remove o terminal menos recente; o id vai para a lista de aposentados.
         let victim = self
             .streams
             .iter()
             .filter(|(_, s)| s.status.is_terminal())
-            .min_by_key(|(id, s)| (s.last_activity_ms, **id))
-            .map(|(id, _)| *id);
+            .min_by_key(|(key, s)| (s.last_activity_ms, key.1))
+            .map(|(key, _)| key.clone());
         match victim {
-            Some(id) => {
-                self.streams.remove(&id);
-                self.retired.push_back(id);
-                if self.retired.len() > RETIRED_LIMIT {
-                    self.retired.pop_front();
-                }
+            Some(key) => {
+                self.streams.remove(&key);
+                self.retired.insert(key);
                 true
             }
             None => false,

@@ -11,4 +11,5 @@ pub mod monitor;
 pub mod protocol;
 pub mod runtime;
 pub mod speech;
+pub mod store;
 pub mod verification;

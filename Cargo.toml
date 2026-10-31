@@ -5,9 +5,11 @@ edition = "2024"
 
 [dependencies]
 futures = "0.3"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustix = { version = "1.1.6", features = ["fs"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
+sha2 = "0.11.0"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util", "fs"] }
 tokio-util = "0.7.20"

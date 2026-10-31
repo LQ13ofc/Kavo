@@ -57,9 +57,16 @@ Após estado terminal, eventos novos são rejeitados. Reenvio idêntico do últi
 
 Janela de duplicatas: últimas 64 sequências por stream. Comparação exata do conteúdo canônico (sem hash). Mesma sequência com conteúdo diferente é `Rejected`.
 
+Identidade do stream: `(session_id, stream_id)`. O mesmo `stream_id` em outra sessão é outro stream.
+
+Aposentadoria (permanente no processo):
+- Stream encerrado, cancelado, expirado ou removido por capacidade fica aposentado. Nunca é reaberto, mesmo que o estado tenha sido removido.
+- `CANCEL` de stream desconhecido aposenta o id: o stream não pode começar depois.
+- Custo: um registro de 16 bytes + sessão por stream da vida do processo. Para uso pessoal, estimado em centenas de KB por ano. Não é limitado.
+
 Limites:
-- `speech.max_streams` (padrão 16). Ao atingir o limite, remove-se o stream terminal menos recente. Se todos estiverem ativos, o novo é rejeitado.
-- Ids removidos por capacidade são lembrados em uma lista de 256. Stream nessa lista não pode ser reaberto com `sequence` 1. Limitação: após 256 remoções, um id antigo poderia ser reaberto.
+- `speech.max_streams` (padrão 16). Ao atingir o limite, remove-se o terminal menos recente. Se todos estiverem ativos, o novo é rejeitado.
+- 256 segmentos por stream. Acima disso, `Rejected`.
 - 256 segmentos por stream. Acima disso, `Rejected`.
 
 ## 2. Intent Engine (`INTENT_DETECTED`)
@@ -88,7 +95,7 @@ Consistência estado × conteúdo:
 - `NO_INTENT` e `CANCELLED`: não têm `intent`.
 - `PROVISIONAL`: sem restrição adicional.
 
-Revisões (`InterpretationTracker`): mesma regra de ordem do STT. `source_revision` não pode regredir. Stream e segmento são fixados na primeira revisão; trocar é `Rejected`. Interpretação `CANCELLED` rejeita revisões seguintes.
+Revisões (`InterpretationTracker`): mesma regra de ordem do STT. `source_revision` não pode regredir. Stream e segmento são fixados na primeira revisão; trocar é `Rejected`. Chave: `(session_id, interpretation_id)`. Interpretação `CANCELLED` rejeita revisões seguintes.
 
 ## 3. Prontidão para prosseguir (`ReadinessGate`)
 
@@ -113,7 +120,7 @@ Regras:
 4. Sem `speech.min_confidence` configurado, nenhuma confiança é exigida. Com ele configurado, engine sem confiança não passa.
 5. Risco `SENSITIVE` ou `IRREVERSIBLE` exige `policy_confirmation = true`.
 6. Chave de execução = `segmento | intenção | parâmetros canônicos`. Mesma chave não é admitida duas vezes. Nova intenção no mesmo segmento gera `Supersede`.
-7. Quando o stream termina, cancela ou expira, os registros de interpretação e de admissão dele são liberados.
+7. Quando o stream termina, cancela ou expira, os registros de **interpretação** são liberados. As **admissões** permanecem: nenhuma execução é repetida no mesmo processo, mesmo com reenvio ou reabertura.
 
 Quem fornece o risco e a confirmação é o Capability Registry e o Policy Engine, que ainda não existem. Hoje o monitor usa `RiskClass::Read` e `policy_confirmation = false`, e não executa nada.
 
@@ -145,3 +152,69 @@ Limite de confiança: sem valor padrão. Deve vir de medição (baseline).
 - Logs registram rótulos (`APPLIED`, `GAP`, `REJECTED`, `ADMIT`, ...), contadores, ids e impressões digitais da chave. Não registram texto transcrito, nome de capacidade nem valor de parâmetro.
 - Erros de validação dos payloads não ecoam valores enviados pelo produtor.
 - Nomes de tipo desconhecido são limitados a 32 caracteres e escapados antes de entrar em log e em `ERROR`.
+
+## 8. Lacunas e recuperação do produtor (Phase 4.2 final)
+
+- O monitor detecta lacuna (`Gap`), mas não há sinal de volta ao produtor. Não há NACK nesta versão (decisão pendente).
+- O produtor sabe de falha só quando recebe `ERROR`. Hoje isso acontece em payload inválido e em falha de entrega garantida (`[DELIVERY_FAILED]`, quando o monitor não aceita no prazo).
+- Recuperação recomendada, sem NACK: reenviar o mesmo evento com a mesma `sequence` e o mesmo conteúdo. Reenvio idêntico é `Duplicate`, e reenvio de evento novo é `Applied`. Não reenvie com outro conteúdo sob a mesma `sequence` (vira `Rejected`).
+- Se uma lacuna não tiver `ERROR` (perda sem resposta), o produtor não sabe. Limitação aceita até decisão sobre NACK ou consulta de estado.
+
+## 9. Persistência durável (D-31, implementada)
+
+Estado durável em SQLite (`src/store.rs`, D-010). Arquivo: `store.path` / `KAVO_STORE_PATH`; padrão `$XDG_DATA_HOME/kavo/kavo.db`. Modo 0600.
+
+Esquema v1 (`meta.schema_version = 1`; versão desconhecida = recusa de abrir):
+
+| Tabela | Chave de unicidade | Conteúdo |
+|---|---|---|
+| `streams` | (`session_id`, `stream_id`) | status (`OPEN`, `ENDED`, `CANCELLED`, `FAILED`, `TIMED_OUT`, `INTERRUPTED`, `REJECTED`) |
+| `interpretations` | (`session_id`, `interpretation_id`) | stream, segmento, revisão, `source_revision`, digest do conteúdo, `cancelled` |
+| `admission_keys` | (`session_id`, `execution_key`) | chave admitida, segmento, stream, interpretação, intenção. Nunca apagada |
+| `segment_admission` | (`session_id`, `segment_id`) | ponteiro para a chave atual, status (`ADMITTED`, `CANCELLED`) |
+
+Dados gravados: ids, status, revisões, digests SHA-256 de chaves e conteúdos e o nome da capacidade (ex.: `OPEN_APPLICATION`). Não são gravados texto transcrito, valores de parâmetro nem áudio.
+
+Semântica de admissão:
+1. Interpretação estável sobre texto confirmado, passando pelo gate → `Decision::Admit`/`Supersede` (ainda não é admissão).
+2. Transação `IMMEDIATE`: insere a chave em `admission_keys` (única por sessão, para sempre), troca o ponteiro do segmento e grava a interpretação. `COMMIT` com `synchronous=FULL`.
+3. Só depois do `COMMIT`, o monitor registra `ADMIT` e atualiza a memória. Chave já existente → `AlreadyAdmitted`, nada gravado.
+4. Falha de gravação → `NOT_READY(STORE_UNAVAILABLE)`. Nada é admitido.
+
+Supersede: a chave anterior permanece consumida. Se a intenção antiga voltar, é `AlreadyAdmitted`, nunca reexecutada.
+
+Semântica de cancelamento: `CANCEL` de stream grava, em uma transação, o stream como `CANCELLED`, as interpretações como `cancelled` e as admissões do stream como `CANCELLED`. As chaves continuam consumidas. Um id desconhecido cancelado vira aposentado (`CANCELLED` sem `OPEN`).
+
+Identidade no reinício:
+- Todo stream já gravado é aposentado. Um stream que estava `OPEN` no reinício vira `INTERRUPTED` e nunca é retomado. O produtor deve iniciar um stream novo com `stream_id` novo.
+- Revisões antigas são rejeitadas (`Stale`) porque as revisões estão no banco.
+- Admissões são restauradas. Reenvio nunca executa de novo.
+
+Falhas:
+- Banco corrompido, esquema desconhecido ou tabela ausente: o núcleo não inicia (fail-closed).
+- Falha de gravação em tempo de execução: nenhuma admissão. O núcleo continua aceitando eventos.
+- Interrupção no meio de gravação: transação não confirmada não existe depois do reinício.
+
+Concorrência: escritores concorrentes são serializados por `BEGIN IMMEDIATE`. Uma chave é admitida no máximo uma vez, mesmo entre conexões diferentes (testado com 12 threads).
+
+Retenção: nenhuma. Admissões são imutáveis e nada é apagado automaticamente. Estimativa: uma linha de ~200 bytes por admissão, sem limite. Política de retenção pendente (D-31).
+
+Limitações restantes:
+- Após reinício, um stream interrompido não é recuperado. Eventos já enviados não são reprocessados.
+- Capacidade de streams ativos (`speech.max_streams`, padrão 16) limita fluxos simultâneos. Streams não encerrados ocupam vagas até o timeout.
+- Ainda não há Execution Engine: `ADMIT` é só uma decisão durável, não uma execução.
+- Sem NACK: lacunas continuam sem sinal ao produtor (D-35).
+
+## 10. Logs e mensagens de erro
+
+- Logs registram rótulos (`APPLIED`, `GAP`, `REJECTED`, `ADMIT`, ...), contadores, ids e impressão curta da chave (12 caracteres do digest). Não registram texto transcrito, nome de capacidade nem valor de parâmetro.
+- Erros de validação dos payloads não ecoam valores enviados pelo produtor.
+- Nomes de tipo desconhecido são limitados a 32 caracteres e escapados antes de entrar em log e em `ERROR`.
+
+## 11. Riscos conhecidos da persistência síncrona (não corrigidos)
+
+- O monitor roda numa única tarefa e grava de forma síncrona. Cada `COMMIT` faz `fsync` (WAL + `synchronous=FULL`). Escritas por evento: abertura de stream, transição terminal, interpretação, admissão e cancelamento.
+- Com disco lento, o monitor fica bloqueado. A fila do barramento (256) enche e a entrega garantida falha após `ipc.request_timeout_ms` (padrão 2 s). O produtor recebe `[DELIVERY_FAILED]`. Nenhuma admissão é perdida, mas eventos são recusados.
+- `busy_timeout` = 5 s. Um segundo escritor (outro processo) pode bloquear a tarefa por até esse tempo.
+- `quick_check` roda a cada inicialização. Em banco grande, o início pode demorar.
+- Não medido. A correção natural é mover as gravações para `spawn_blocking` ou para um escritor dedicado com fila, mantendo a ordem. Pendente de decisão.

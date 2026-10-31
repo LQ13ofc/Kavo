@@ -18,6 +18,14 @@ pub struct KavoConfig {
     pub logging: LoggingConfig,
     pub ipc: IpcConfig,
     pub speech: SpeechConfig,
+    pub store: StoreConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StoreConfig {
+    /// Caminho do banco SQLite de admissões. `None` usa `$XDG_DATA_HOME/kavo/kavo.db`.
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -140,6 +148,9 @@ impl KavoConfig {
         if let Some(v) = env("KAVO_IPC_SOCKET_PATH") {
             self.ipc.socket_path = Some(PathBuf::from(v));
         }
+        if let Some(v) = env("KAVO_STORE_PATH") {
+            self.store.path = Some(PathBuf::from(v));
+        }
         if let Some(v) = env("KAVO_SHUTDOWN_TIMEOUT_MS") {
             self.runtime.shutdown_timeout_ms = parse_u64("KAVO_SHUTDOWN_TIMEOUT_MS", &v)?;
         }
@@ -155,6 +166,11 @@ impl KavoConfig {
         }
         if self.ipc.request_timeout_ms == 0 {
             return Err(invalid("ipc.request_timeout_ms", "deve ser maior que zero"));
+        }
+        if let Some(path) = &self.store.path {
+            if !path.is_absolute() {
+                return Err(invalid("store.path", "deve ser um caminho absoluto"));
+            }
         }
         if self.speech.stream_idle_timeout_ms == 0 {
             return Err(invalid(
@@ -194,6 +210,33 @@ impl KavoConfig {
         match &self.ipc.socket_path {
             Some(path) => Ok(path.clone()),
             None => Ok(runtime_dir()?.join(SOCKET_FILE)),
+        }
+    }
+
+    /// Caminho do banco de admissões. O diretório pai é criado com modo 0700.
+    pub fn store_path(&self) -> Result<PathBuf> {
+        match &self.store.path {
+            Some(path) => {
+                // Caminho explícito: o diretório pai precisa ser privado, como o socket.
+                let parent = path.parent().ok_or_else(|| {
+                    KavoError::Config(format!("store.path '{}' sem diretório pai", path.display()))
+                })?;
+                let meta = std::fs::symlink_metadata(parent)
+                    .map_err(|e| KavoError::io(format!("verificar {}", parent.display()), e))?;
+                use std::os::unix::fs::PermissionsExt;
+                if !meta.file_type().is_dir() || meta.permissions().mode() & 0o077 != 0 {
+                    return Err(KavoError::Config(format!(
+                        "diretório '{}' do banco deve ser um diretório privado (0700)",
+                        parent.display()
+                    )));
+                }
+                Ok(path.clone())
+            }
+            None => {
+                let dir = xdg_dir("XDG_DATA_HOME", ".local/share")?.join(APP_DIR);
+                ensure_private_dir(&dir)?;
+                Ok(dir.join("kavo.db"))
+            }
         }
     }
 
@@ -241,6 +284,22 @@ fn xdg_dir(var: &str, fallback: &str) -> Result<PathBuf> {
 /// Diretório de configuração do Kavo (`$XDG_CONFIG_HOME/kavo`).
 pub fn config_dir() -> Result<PathBuf> {
     Ok(xdg_dir("XDG_CONFIG_HOME", ".config")?.join(APP_DIR))
+}
+
+fn ensure_private_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| KavoError::io(format!("criar {}", dir.display()), e))?;
+    let meta = std::fs::symlink_metadata(dir)
+        .map_err(|e| KavoError::io(format!("verificar {}", dir.display()), e))?;
+    if !meta.file_type().is_dir() {
+        return Err(KavoError::Config(format!(
+            "{} não é um diretório real",
+            dir.display()
+        )));
+    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| KavoError::io(format!("permissões de {}", dir.display()), e))
 }
 
 /// Diretório de runtime do Kavo (`$XDG_RUNTIME_DIR/kavo`), criado com permissão 0700.

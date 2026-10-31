@@ -37,6 +37,9 @@ pub enum KavoError {
     #[error("tempo esgotado após {0:?}")]
     Timeout(Duration),
 
+    #[error("armazenamento indisponível: {0}")]
+    Store(String),
+
     #[error("componente '{component}' falhou: {reason}")]
     Component { component: String, reason: String },
 }
@@ -67,6 +70,7 @@ pub enum ErrorKind {
     AlreadyRunning,
     ComponentFailed,
     Cancelled,
+    StoreUnavailable,
     Io,
     /// Reservado para falhas não classificadas. Nenhum erro atual cai aqui ainda.
     Internal,
@@ -85,6 +89,7 @@ impl ErrorKind {
             Self::AlreadyRunning => "ALREADY_RUNNING",
             Self::ComponentFailed => "COMPONENT_FAILED",
             Self::Cancelled => "CANCELLED",
+            Self::StoreUnavailable => "STORE_UNAVAILABLE",
             Self::Io => "IO",
             Self::Internal => "INTERNAL",
         }
@@ -96,6 +101,7 @@ impl KavoError {
         match self {
             Self::Config(_) => ErrorKind::ConfigInvalid,
             Self::Io { .. } => ErrorKind::Io,
+            Self::Store(_) => ErrorKind::StoreUnavailable,
             Self::Protocol(_) => ErrorKind::InvalidMessage,
             Self::UnsupportedVersion(_) => ErrorKind::UnsupportedVersion,
             Self::UnsupportedType(_) => ErrorKind::UnsupportedMessageType,

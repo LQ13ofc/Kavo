@@ -24,7 +24,17 @@ Legenda: **Aprovada** (pelo usuário) · **Provisória** (usada, aguarda revisã
 | D-26 | Timeout de stream ocioso 10 s; máximo 16 streams | Provisória | Valores sem medição; configuráveis em `[speech]` |
 | D-27 | Monitor de contratos é assinante do barramento, sem ações | Provisória | Valida no daemon real antes de existir consumidor de negócio |
 | D-28 | Lacuna de sequência não é aplicada e não há sinal de volta ao produtor | Provisória | Limitação conhecida; decidir se 1.1 precisa de `NACK` |
-| D-29 | Ids de stream removidos: lista de 256 contra reabertura | Provisória | Limitação: id antigo pode ser reaberto após 256 remoções |
+| D-29 | Streams aposentados ficam para sempre no processo (sem limite) | Provisória | Substitui a lista de 256: sem reabertura por limite de memória. Não sobrevive a reinício |
+| D-31 | Registro durável de admissões e aposentados (SQLite, D-010) antes de qualquer execução | Implementada; **retenção pendente** | Ver `SPEECH-INTENT-CONTRACTS.md` §9. Não há Execution Engine ainda |
+| D-36 | Política de retenção de admissões: nenhuma (imutáveis) | Pendente | Precisa de aprovação antes de crescer sem limite |
+| D-37 | Stream interrompido no reinício nunca é retomado | Provisória | Produtor reinicia com `stream_id` novo |
+| D-38 | Banco com erro ou esquema desconhecido impede o início | Provisória | Fail-closed |
+| D-39 | Só digests SHA-256 de chaves e conteúdo são gravados | Provisória | Privacidade: sem texto nem parâmetros em disco |
+| D-40 | Nota de nomenclatura: IDs D-031..D-039 aqui não coincidem com `DECISOES-CONSOLIDADAS.md` (ex.: D-031 = Capability Registry) | Pendente | Renumerar com `KD-` para evitar conflito |
+| D-32 | `error_code` restrito à taxonomia aprovada | Provisória | Sem códigos inventados; 2xxx/3xxx só após aprovação |
+| D-33 | Identidade de stream e de interpretação é `(session_id, id)` | Provisória | Evita colisão e cancelamento entre sessões |
+| D-34 | Admissões de execução são permanentes no processo | Provisória | Impede reexecução por reenvio ou reabertura no mesmo processo |
+| D-35 | Sem NACK: produtor recupera por reenvio idêntico após `ERROR` | Pendente | Ver `SPEECH-INTENT-CONTRACTS.md` seção 8 |
 | D-30 | `serde_json` com `float_roundtrip` | Provisória | Timestamps precisam de ida e volta exata |
 | D-10 | `sender` obrigatório no envelope | Provisória | Motivo: auditoria |
 | D-11 | Envelope 1.0 sem campos text/intent/slots/timeout_seconds/transport_version | Provisória | Voltam em versão 1.1 com o componente que os usa |

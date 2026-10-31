@@ -14,6 +14,7 @@ use crate::error::{KavoError, Result};
 use crate::instance::InstanceLock;
 use crate::ipc::{IpcServer, IpcSettings};
 use crate::monitor::ContractMonitor;
+use crate::store::Store;
 
 /// Recursos entregues a um componente ao iniciar.
 #[derive(Debug, Clone)]
@@ -142,15 +143,16 @@ pub async fn run(config: KavoConfig) -> Result<()> {
     let mut sigint =
         signal(SignalKind::interrupt()).map_err(|e| KavoError::io("registrar SIGINT", e))?;
 
+    // Estado durável antes de aceitar conexões. Falha aqui impede o início (fail-closed).
+    let store = Store::open(&config.store_path()?)?;
+    info!(store = %store.path().display(), "armazenamento de admissões aberto");
+
     let bus = EventBus::new(256, Duration::from_millis(config.ipc.request_timeout_ms));
     // Assinatura criada antes do IPC aceitar conexões: nenhuma mensagem inicial se perde.
     let monitor_rx = bus.subscribe();
     let mut supervisor = Supervisor::new(bus);
-    supervisor.spawn(ContractMonitor::new(
-        monitor_rx,
-        &config.speech,
-        Default::default(),
-    ));
+    let monitor = ContractMonitor::open(monitor_rx, &config.speech, Default::default(), store)?;
+    supervisor.spawn(monitor);
     let server = IpcServer::bind(&socket, IpcSettings::from_config(&config))?;
     supervisor.spawn(server);
     info!(version = env!("CARGO_PKG_VERSION"), "Kavo em execução");

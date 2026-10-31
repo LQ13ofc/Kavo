@@ -4,7 +4,7 @@
 //! `ReadinessGate` decide apenas se uma interpretação pode ser oferecida ao Planner/Policy,
 //! e impede admissões repetidas. A autorização continua no Policy Engine.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::error::{KavoError, Result};
 use crate::protocol::check_text;
 use crate::speech::{Acceptance, SegmentSnapshot, TranscriptState, canonical_of, check_confidence};
+use crate::store::{InterpretationRow, sha256_hex};
 
 const MAX_LIST: usize = 32;
 const MAX_OPTIONS: usize = 8;
@@ -225,29 +226,63 @@ struct InterpretationRecord {
     segment_id: Uuid,
     revision: u32,
     source_revision: u32,
-    /// Conteúdo canônico da última revisão, para distinguir reenvio idêntico de conflito.
-    content: String,
+    /// Digest SHA-256 do conteúdo da última revisão: distingue reenvio idêntico de conflito.
+    content_digest: String,
     cancelled: bool,
 }
+
+/// Chave de interpretação: sessão + `interpretation_id`.
+pub type InterpretationKey = (String, Uuid);
 
 /// Rastreia revisões de interpretações: ordem, duplicatas, origem fixa, regressão e cancelamento.
 #[derive(Debug, Default)]
 pub struct InterpretationTracker {
-    records: HashMap<Uuid, InterpretationRecord>,
+    records: HashMap<InterpretationKey, InterpretationRecord>,
 }
 
 impl InterpretationTracker {
-    pub fn apply(&mut self, payload: &InterpretationPayload) -> Acceptance {
-        let content = canonical_of(payload);
-        let Some(last) = self.records.get(&payload.interpretation_id).cloned() else {
+    /// Carrega registros duráveis após reinício.
+    pub fn restore(&mut self, rows: impl IntoIterator<Item = InterpretationRow>) {
+        for row in rows {
+            self.records.insert(
+                (row.session_id.clone(), row.interpretation_id),
+                InterpretationRecord {
+                    stream_id: row.stream_id,
+                    segment_id: row.segment_id,
+                    revision: row.revision,
+                    source_revision: row.source_revision,
+                    content_digest: row.content_digest,
+                    cancelled: row.cancelled,
+                },
+            );
+        }
+    }
+
+    /// Linha durável correspondente a uma revisão aceita.
+    pub fn row_for(session: &str, payload: &InterpretationPayload) -> InterpretationRow {
+        InterpretationRow {
+            session_id: session.to_owned(),
+            interpretation_id: payload.interpretation_id,
+            stream_id: payload.stream_id,
+            segment_id: payload.segment_id,
+            revision: payload.revision,
+            source_revision: payload.source_revision,
+            content_digest: sha256_hex(&canonical_of(payload)),
+            cancelled: payload.state == InterpretationState::Cancelled,
+        }
+    }
+
+    pub fn apply(&mut self, session: &str, payload: &InterpretationPayload) -> Acceptance {
+        let digest = sha256_hex(&canonical_of(payload));
+        let key: InterpretationKey = (session.to_owned(), payload.interpretation_id);
+        let Some(last) = self.records.get(&key).cloned() else {
             if payload.revision != 0 {
                 return Acceptance::Gap {
                     expected: 0,
                     got: u64::from(payload.revision),
                 };
             }
-            self.records
-                .insert(payload.interpretation_id, record(payload, content));
+            self.records.insert(key, record(payload, digest));
             return Acceptance::Applied;
         };
 
@@ -257,7 +292,7 @@ impl InterpretationTracker {
             );
         }
         if payload.revision == last.revision {
-            return if last.content == content {
+            return if last.content_digest == digest {
                 Acceptance::Duplicate
             } else {
                 Acceptance::Rejected("revisão reutilizada com conteúdo diferente".to_owned())
@@ -283,16 +318,15 @@ impl InterpretationTracker {
         if payload.source_revision < last.source_revision {
             return Acceptance::Rejected("source_revision regrediu".to_owned());
         }
-        self.records
-            .insert(payload.interpretation_id, record(payload, content));
+        self.records.insert(key, record(payload, digest));
         Acceptance::Applied
     }
 
-    /// Marca como canceladas todas as interpretações de um stream.
-    pub fn cancel_stream(&mut self, stream_id: &Uuid) -> usize {
+    /// Marca como canceladas as interpretações de um stream. Retorna quantas mudaram.
+    pub fn cancel_stream(&mut self, session: &str, stream_id: &Uuid) -> usize {
         let mut changed = 0;
-        for rec in self.records.values_mut() {
-            if rec.stream_id == *stream_id && !rec.cancelled {
+        for (key, rec) in self.records.iter_mut() {
+            if key.0 == session && rec.stream_id == *stream_id && !rec.cancelled {
                 rec.cancelled = true;
                 changed += 1;
             }
@@ -300,19 +334,21 @@ impl InterpretationTracker {
         changed
     }
 
-    /// Esquece as interpretações de um stream que já terminou.
-    pub fn forget_stream(&mut self, stream_id: &Uuid) {
-        self.records.retain(|_, rec| rec.stream_id != *stream_id);
+    /// Libera registros de memória de um stream que terminou. Os duráveis permanecem no banco.
+    /// Revisões antigas depois disso caem em `Gap` (o estado de origem não é mais conhecido).
+    pub fn forget_stream(&mut self, session: &str, stream_id: &Uuid) {
+        self.records
+            .retain(|key, rec| !(key.0 == session && rec.stream_id == *stream_id));
     }
 }
 
-fn record(payload: &InterpretationPayload, content: String) -> InterpretationRecord {
+fn record(payload: &InterpretationPayload, content_digest: String) -> InterpretationRecord {
     InterpretationRecord {
         stream_id: payload.stream_id,
         segment_id: payload.segment_id,
         revision: payload.revision,
         source_revision: payload.source_revision,
-        content,
+        content_digest,
         cancelled: payload.state == InterpretationState::Cancelled,
     }
 }
@@ -335,23 +371,33 @@ pub struct SourceSnapshot {
     pub segment: Option<SegmentSnapshot>,
 }
 
-/// Chave de execução: segmento + intenção + parâmetros canônicos.
-/// Mesma chave não é admitida duas vezes.
+/// Chave de execução: digest de segmento + intenção + parâmetros canônicos.
+/// Mesma chave não é admitida duas vezes na mesma sessão. Só o digest é gravado.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExecutionKey(String);
 
 impl ExecutionKey {
     fn new(payload: &InterpretationPayload, intent: &IntentCandidate) -> Self {
         let params = serde_json::to_string(&payload.parameters).unwrap_or_default();
-        Self(format!("{}|{}|{}", payload.segment_id, intent.name, params))
+        Self(sha256_hex(&format!(
+            "{}|{}|{}",
+            payload.segment_id, intent.name, params
+        )))
     }
 
-    /// Impressão digital para logs: não expõe os parâmetros (podem conter dados do usuário).
-    pub fn fingerprint(&self) -> u64 {
-        use std::hash::{DefaultHasher, Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        self.0.hash(&mut hasher);
-        hasher.finish()
+    /// Chave lida do banco.
+    pub fn from_stored(digest: String) -> Self {
+        Self(digest)
+    }
+
+    /// Digest persistido.
+    pub fn as_stored(&self) -> &str {
+        &self.0
+    }
+
+    /// Impressão curta para logs. Não expõe parâmetros.
+    pub fn fingerprint(&self) -> String {
+        self.0.chars().take(12).collect()
     }
 }
 
@@ -365,11 +411,19 @@ impl Decision {
         }
     }
 
-    pub fn fingerprint(&self) -> Option<u64> {
+    pub fn fingerprint(&self) -> Option<String> {
         match self {
             Self::Admit(k) | Self::Duplicate(k) => Some(k.fingerprint()),
             Self::Supersede { next, .. } => Some(next.fingerprint()),
             Self::NotReady(_) => None,
+        }
+    }
+
+    /// Chave que o monitor precisa gravar antes de considerar a admissão feita.
+    pub fn admitted_key(&self) -> Option<&ExecutionKey> {
+        match self {
+            Self::Admit(k) | Self::Supersede { next: k, .. } => Some(k),
+            _ => None,
         }
     }
 }
@@ -382,19 +436,25 @@ pub enum NotReadyReason {
     Cancelled,
     StreamInactive,
     SourceUnconfirmed,
-    SourceRevised { current: u32 },
+    SourceRevised {
+        current: u32,
+    },
     MissingParameters,
     BelowMinConfidence,
     ConfirmationRequired,
+    /// Chave já admitida antes nesta sessão, mas não é a atual do segmento.
+    AlreadyAdmitted,
+    /// Gravação durável indisponível: nada foi admitido.
+    StoreUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
-    /// Pode ser oferecida ao Planner/Policy. Não é autorização.
+    /// Pode ser oferecida ao Planner/Policy, após gravação durável. Não é autorização.
     Admit(ExecutionKey),
     /// Mesma chave já admitida: nada a fazer.
     Duplicate(ExecutionKey),
-    /// Nova chave substitui a admitida para o mesmo segmento. Quem executou a anterior deve cancelá-la.
+    /// Nova chave substitui a admitida para o mesmo segmento. A anterior permanece consumida.
     Supersede {
         previous: ExecutionKey,
         next: ExecutionKey,
@@ -402,25 +462,46 @@ pub enum Decision {
     NotReady(NotReadyReason),
 }
 
-/// Decide quando uma interpretação está estável o bastante para seguir. Mantém o registro de admissões.
+/// Decide quando uma interpretação está pronta para seguir. `evaluate` não altera estado:
+/// só `record`, depois da gravação durável, muda a memória.
 #[derive(Debug)]
 pub struct ReadinessGate {
     /// `None` = sem limite. Não há valor padrão: o limite deve vir de medição (ver docs).
     min_confidence: Option<f32>,
-    /// Segmento → (stream dono, chave admitida).
-    admitted: HashMap<Uuid, (Uuid, ExecutionKey)>,
+    /// (sessão, segmento) → chave atual.
+    current: HashMap<(String, Uuid), ExecutionKey>,
+    /// (sessão, chave) já admitida alguma vez. Nunca é removida.
+    consumed: HashSet<(String, ExecutionKey)>,
 }
 
 impl ReadinessGate {
     pub fn new(min_confidence: Option<f32>) -> Self {
         Self {
             min_confidence,
-            admitted: HashMap::new(),
+            current: HashMap::new(),
+            consumed: HashSet::new(),
+        }
+    }
+
+    /// Restaura o estado durável após reinício.
+    pub fn restore(
+        &mut self,
+        consumed: impl IntoIterator<Item = (String, String)>,
+        current: impl IntoIterator<Item = (String, Uuid, String)>,
+    ) {
+        for (session, key) in consumed {
+            self.consumed
+                .insert((session, ExecutionKey::from_stored(key)));
+        }
+        for (session, segment, key) in current {
+            self.current
+                .insert((session, segment), ExecutionKey::from_stored(key));
         }
     }
 
     pub fn evaluate(
-        &mut self,
+        &self,
+        session: &str,
         payload: &InterpretationPayload,
         source: SourceSnapshot,
         risk: RiskClass,
@@ -467,31 +548,29 @@ impl ReadinessGate {
         }
 
         let key = ExecutionKey::new(payload, intent);
-        let owner = payload.stream_id;
-        match self
-            .admitted
-            .get(&payload.segment_id)
-            .map(|(_, k)| k.clone())
-        {
-            Some(previous) if previous == key => Decision::Duplicate(key),
-            Some(previous) => {
-                self.admitted
-                    .insert(payload.segment_id, (owner, key.clone()));
-                Decision::Supersede {
-                    previous,
-                    next: key,
-                }
-            }
-            None => {
-                self.admitted
-                    .insert(payload.segment_id, (owner, key.clone()));
-                Decision::Admit(key)
-            }
+        let slot = (session.to_owned(), payload.segment_id);
+        let current = self.current.get(&slot);
+        if current == Some(&key) {
+            return Decision::Duplicate(key);
+        }
+        if self.consumed.contains(&(session.to_owned(), key.clone())) {
+            return not_ready(NotReadyReason::AlreadyAdmitted);
+        }
+        match current {
+            Some(previous) => Decision::Supersede {
+                previous: previous.clone(),
+                next: key,
+            },
+            None => Decision::Admit(key),
         }
     }
 
-    /// Esquece admissões de um stream que terminou. Quem admitiu deve ter cancelado antes, se necessário.
-    pub fn forget_stream(&mut self, stream_id: &Uuid) {
-        self.admitted.retain(|_, (owner, _)| owner != stream_id);
+    /// Aplica uma decisão já gravada no banco. Não chamar antes da gravação.
+    pub fn record(&mut self, session: &str, segment_id: Uuid, decision: &Decision) {
+        if let Some(key) = decision.admitted_key() {
+            self.consumed.insert((session.to_owned(), key.clone()));
+            self.current
+                .insert((session.to_owned(), segment_id), key.clone());
+        }
     }
 }
