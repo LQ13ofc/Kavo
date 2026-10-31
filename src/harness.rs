@@ -55,6 +55,10 @@ pub const SCENARIOS: &[(&str, &str)] = &[
         "arquivo inválido impede o início (fail-closed)",
     ),
     (
+        "store-fault",
+        "falha de gravação do SQLite não é declarada como sucesso",
+    ),
+    (
         "ipc-stream",
         "fluxo STT contra núcleo em execução via socket",
     ),
@@ -117,6 +121,7 @@ pub async fn run(name: &str, opts: &Options) -> Result<Report> {
         "restart" => restart(&opts.dir).await,
         "concurrency" => concurrency(&opts.dir).await,
         "store-open-failure" => store_open_failure(&opts.dir),
+        "store-fault" => store_fault(&opts.dir).await,
         "ipc-stream" => ipc_stream(opts).await,
         other => Err(KavoError::Config(format!("cenário desconhecido '{other}'"))),
     }
@@ -656,6 +661,67 @@ fn store_open_failure(dir: &Path) -> Result<Report> {
     Ok(r)
 }
 
+/// Falha real do SQLite: trigger aborta a atualização de status. Nada pode ser declarado como gravado.
+async fn store_fault(dir: &Path) -> Result<Report> {
+    const TRIGGER: &str = "CREATE TRIGGER falha_injetada BEFORE UPDATE OF status ON streams \
+        BEGIN SELECT RAISE(ABORT, 'falha injetada'); END;";
+    let mut r = Report::new("store-fault");
+    let path = fresh_store(dir, "store-fault");
+    let mut p = Pipeline::start(&path).await?;
+    let (session, stream, seg) = ("sessao-fault", Uuid::new_v4(), Uuid::new_v4());
+
+    p.send(speech_msg(session, stream, 1, started(seg))?)
+        .await?;
+    p.wait_for(|s| s.speech_applied >= 1).await;
+
+    let conn = rusqlite::Connection::open(&path).map_err(|e| KavoError::Store(e.to_string()))?;
+    conn.busy_timeout(WAIT)
+        .map_err(|e| KavoError::Store(e.to_string()))?;
+    conn.execute_batch(TRIGGER)
+        .map_err(|e| KavoError::Store(e.to_string()))?;
+
+    p.send(speech_msg(session, stream, 2, SpeechEvent::StreamEnded)?)
+        .await?;
+    let sentinel = Uuid::new_v4();
+    p.send(speech_msg(session, sentinel, 1, started(Uuid::new_v4()))?)
+        .await?;
+    let snap = p.wait_for(|s| s.speech_applied >= 2).await;
+    r.check(
+        "falha de gravação contada e evento não aplicado",
+        snap.store_errors >= 1 && snap.speech_applied == 2,
+        stats_detail(&snap),
+    );
+    let during = p.stream_status(session, &stream)?;
+    r.check(
+        "status no banco continua OPEN durante a falha",
+        during.as_deref() == Some("OPEN"),
+        format!("{during:?}"),
+    );
+
+    conn.execute_batch("DROP TRIGGER falha_injetada")
+        .map_err(|e| KavoError::Store(e.to_string()))?;
+    // Reenvio idêntico após a falha: o produtor recupera pelo mesmo evento (D-35).
+    p.send(speech_msg(session, stream, 2, SpeechEvent::StreamEnded)?)
+        .await?;
+    let after_sentinel = Uuid::new_v4();
+    p.send(speech_msg(
+        session,
+        after_sentinel,
+        1,
+        started(Uuid::new_v4()),
+    )?)
+    .await?;
+    let snap = p.wait_for(|s| s.speech_applied >= 4).await;
+    let after = p.stream_status(session, &stream)?;
+    r.check(
+        "reenvio após remover a falha é gravado como ENDED",
+        after.as_deref() == Some("ENDED") && snap.speech_applied == 4,
+        format!("{after:?} {}", stats_detail(&snap)),
+    );
+    p.stop().await;
+    Ok(r)
+}
+
 async fn ipc_stream(opts: &Options) -> Result<Report> {
     let mut r = Report::new("ipc-stream");
     let (Some(socket), Some(store_path)) = (opts.socket.as_deref(), opts.store.as_deref()) else {
@@ -663,13 +729,16 @@ async fn ipc_stream(opts: &Options) -> Result<Report> {
             "ipc-stream exige --socket e --store".to_owned(),
         ));
     };
+    let timeout = opts.ipc.request_timeout;
     let before = ipc::ping(socket, opts.ipc).await;
     r.check(
         "núcleo responde antes do cenário",
         matches!(before, Verification::Success(_)),
         format!("{before:?}"),
     );
+    let store = Store::open(store_path)?;
 
+    // Um stream sequencial: uma conexão, em ordem.
     let (session, stream, seg) = ("sessao-ipc", Uuid::new_v4(), Uuid::new_v4());
     let events = [
         speech_msg(session, stream, 1, started(seg))?,
@@ -682,19 +751,64 @@ async fn ipc_stream(opts: &Options) -> Result<Report> {
         speech_msg(session, stream, 3, SpeechEvent::StreamEnded)?,
     ];
     // Uma conexão para o stream inteiro: conexões separadas podem ser processadas fora de ordem.
-    send_ordered(socket, &events, opts.ipc.request_timeout).await?;
-
-    let store = Store::open(store_path)?;
-    let deadline = Instant::now() + WAIT;
-    let mut status = store.stream_status(session, &stream)?;
-    while status.as_deref() != Some("ENDED") && Instant::now() < deadline {
-        tokio::time::sleep(POLL * 10).await;
-        status = store.stream_status(session, &stream)?;
-    }
+    send_ordered(socket, &events, timeout).await?;
+    let status = wait_status(&store, session, &stream, "ENDED").await?;
     r.check(
         "stream enviado por socket gravado como ENDED",
         status.as_deref() == Some("ENDED"),
         format!("{status:?}"),
+    );
+
+    // Quatro sessões em paralelo, cada uma com a própria conexão e ordem interna.
+    let mut jobs = Vec::new();
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        let sid = format!("sessao-ipc-par-{i}");
+        let st = Uuid::new_v4();
+        let sg = Uuid::new_v4();
+        let msgs = vec![
+            speech_msg(&sid, st, 1, started(sg))?,
+            speech_msg(&sid, st, 2, transcript(sg, 0, TranscriptState::Confirmed))?,
+            speech_msg(&sid, st, 3, SpeechEvent::StreamEnded)?,
+        ];
+        ids.push((sid.clone(), st));
+        jobs.push(async move { send_ordered(socket, &msgs, timeout).await });
+    }
+    for result in futures::future::join_all(jobs).await {
+        result?;
+    }
+    let mut parallel_ok = true;
+    let mut detail = String::new();
+    for (sid, st) in &ids {
+        let status = wait_status(&store, sid, st, "ENDED").await?;
+        parallel_ok &= status.as_deref() == Some("ENDED");
+        detail.push_str(&format!("{status:?} "));
+    }
+    r.check(
+        "quatro sessões concorrentes gravadas como ENDED",
+        parallel_ok,
+        detail.trim_end(),
+    );
+
+    // CANCEL por socket: só o stream alvo é cancelado.
+    let (csid, cstream, cseg) = ("sessao-ipc-cancel", Uuid::new_v4(), Uuid::new_v4());
+    let keep = Uuid::new_v4();
+    send_ordered(
+        socket,
+        &[
+            speech_msg(csid, cstream, 1, started(cseg))?,
+            speech_msg(csid, keep, 1, started(Uuid::new_v4()))?,
+            cancel_stream_msg(csid, cstream)?,
+        ],
+        timeout,
+    )
+    .await?;
+    let cancelled = wait_status(&store, csid, &cstream, "CANCELLED").await?;
+    r.check(
+        "CANCEL por socket grava CANCELLED sem afetar outro stream da sessão",
+        cancelled.as_deref() == Some("CANCELLED")
+            && store.stream_status(csid, &keep)?.as_deref() == Some("OPEN"),
+        format!("{cancelled:?}"),
     );
 
     let after = ipc::ping(socket, opts.ipc).await;
@@ -704,6 +818,23 @@ async fn ipc_stream(opts: &Options) -> Result<Report> {
         format!("{after:?}"),
     );
     Ok(r)
+}
+
+/// Espera o status do stream no banco até `want` (ou o prazo acabar) e devolve o último lido.
+async fn wait_status(
+    store: &Store,
+    session: &str,
+    stream: &Uuid,
+    want: &str,
+) -> Result<Option<String>> {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let status = store.stream_status(session, stream)?;
+        if status.as_deref() == Some(want) || Instant::now() >= deadline {
+            return Ok(status);
+        }
+        tokio::time::sleep(POLL * 10).await;
+    }
 }
 
 /// Envia mensagens NDJSON em ordem por uma conexão e fecha o envio. STT não responde em caso de sucesso.

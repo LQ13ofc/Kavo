@@ -51,6 +51,11 @@ Legenda: **Aprovada** (pelo usuário) · **Provisória** (usada, aguarda revisã
 | D-45 | Expiração de sessão por inatividade | Pendente | Nenhum prazo aprovado; não implementada |
 | D-46 | Harness A0: fonte virtual gera STT sintético (emissor `fonte-virtual`); não simula captura de áudio nem reconhecimento | Provisória | `kavo harness`; cenários contra barramento, monitor e SQLite reais |
 | D-47 | Producer envia eventos de um mesmo stream em uma conexão, em ordem | Provisória | Conexões separadas podem ser processadas fora de ordem (achado no E2E real); sem NACK (D-35) |
+| D-48 | Falha de gravação é injetada por trigger SQLite (`RAISE(ABORT)`) no cenário `store-fault`, sem alterar código de produção | Provisória | Teste reversível, real no SQLite; reenvio idêntico recupera o estado |
+| D-49 | Cenários do harness só embutidos e escolhidos por argumento; cenários por arquivo não implementados | Provisória | Nenhum requisito aprovado pede arquivos de cenário; adiar até haver necessidade |
+| D-50 | Integração do Session Manager ao daemon (sessões no IPC) fica fora de A0 | Pendente | Exige tipos de mensagem de sessão, dependente de D-09; protocolo não alterado |
+| D-51 | Logs e artefatos E2E ficam em `target/e2e` (ignorado pelo Git), com XDG próprio | Provisória | Não toca dados do usuário; socket limitado a 108 bytes (`SUN_LEN`) |
+| D-52 | Cancelamento de requisição (`correlation_id`) sem alvo no núcleo | Pendente | Não há registro de requisições no daemon; só stream é cancelado pelo socket |
 
 ## Reconciliação 03-PROTOCOLOS × 10-CONTRATOS
 Detalhada em `KAVO-PROTOCOL.md`, seção 7.
